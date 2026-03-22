@@ -43,15 +43,15 @@ const MEME_FILTERS = {
   minMarketCapUsd: 200_000,   // $200K min mcap (GMGN filter)
   minHolders: 500,            // min 500 holders
   // Vol/TVL ratio
-  minVolTvlRatio: 3.0,
+  minVolTvlRatio: 0.5,
   hotVolTvlRatio: 10,
   warmVolTvlRatio: 2,
   // Min volume 24h
-  minVolume24h: 10_000,       // $10K — filter noise
+  minVolume24h: 500,   // pakai vol1h, threshold rendah       // $10K — filter noise
   // Min TVL
-  minTvl: 10_000,             // $10K minimum
+  minTvl: 50,             // TVL dari API tidak akurat, threshold sangat rendah             // $10K minimum
   // Bin step sweet spot
-  minBinStep: 80,
+  minBinStep: 20,          // turunkan untuk tangkap lebih banyak pool
   maxBinStep: 200,
   // Pool age per strategy
   minPoolAgeForBidAskFlip: 72, // 3 hari untuk BidAsk Flip (dari artikel)

@@ -37,6 +37,10 @@ function toStrategyType(s: string | undefined): StrategyType {
     case 'BidAsk':
     case 'BidAskImBalanced':
       return StrategyType.BidAsk;
+    case 'Spot':
+    case 'SPOT_PUMP':
+    case 'SPOT_DUMP':
+      return StrategyType.Spot;
     case 'Curve':  return StrategyType.Curve;
     case 'Spot':   return StrategyType.Spot;
     default:       return StrategyType.BidAsk; // default BidAsk untuk meme

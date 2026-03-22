@@ -16,6 +16,39 @@ import { PositionTracker } from '../modules/positionTracker';
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
+// ── Position Persistence ──────────────────────────────────────────────────
+import * as fs from 'fs';
+const POSITIONS_FILE = 'data/active-positions.json';
+
+function savePositions(positions: ActivePosition[]) {
+  try {
+    fs.mkdirSync('data', { recursive: true });
+    const data = positions.map(p => ({
+      poolAddress: p.poolAddress,
+      poolName: p.poolName,
+      positionKey: p.positionKey.publicKey.toBase58(),
+      strategyType: p.strategyType,
+      binRange: p.binRange,
+      solDeposited: p.solDeposited,
+      openedAt: p.openedAt,
+    }));
+    fs.writeFileSync(POSITIONS_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error('Failed to save positions:', err);
+  }
+}
+
+function loadPositions(): any[] {
+  try {
+    if (!fs.existsSync(POSITIONS_FILE)) return [];
+    const data = JSON.parse(fs.readFileSync(POSITIONS_FILE, 'utf8'));
+    console.log(`   📂 Loaded ${data.length} saved position(s) from disk`);
+    return data;
+  } catch {
+    return [];
+  }
+}
+
 export class DLMMAgent {
   private connection: Connection;
   private wallet: Keypair;
@@ -24,7 +57,6 @@ export class DLMMAgent {
   private cycleCount = 0;
   private telegram: TelegramAlert;
   private tracker: PositionTracker;
-  
 
   private lastPoolFetchAt = 0;
   private pools: PoolInfo[] = [];
@@ -50,6 +82,34 @@ export class DLMMAgent {
     console.log('\n🚀 Agent berjalan...\n');
     const sol = await this.connection.getBalance(this.wallet.publicKey) / LAMPORTS_PER_SOL;
     await this.telegram.alertAgentStart(this.wallet.publicKey.toBase58(), sol);
+
+    // Load posisi yang tersimpan saat bot sebelumnya dimatikan
+    const savedPositions = loadPositions();
+    if (savedPositions.length > 0) {
+      console.log(`\n⚡ Recovering ${savedPositions.length} position(s) dari sesi sebelumnya...`);
+      for (const saved of savedPositions) {
+        try {
+          const positionKey = new Keypair();
+          // Reconstruct minimal ActivePosition untuk monitoring
+          const recovered: ActivePosition = {
+            poolAddress: saved.poolAddress,
+            poolName: saved.poolName,
+            positionKey: { publicKey: { toBase58: () => saved.positionKey } } as any,
+            strategyType: saved.strategyType,
+            binRange: saved.binRange,
+            solDeposited: saved.solDeposited,
+            openedAt: new Date(saved.openedAt),
+            entryPrice: saved.entryPrice || 0,
+            lastChecked: new Date(),
+          };
+          this.activePositions.push(recovered);
+          this.tracker.addPosition(recovered, 0);
+          console.log(`   ✅ Recovered: ${saved.poolName} | dibuka ${new Date(saved.openedAt).toLocaleString('id-ID')}`);
+        } catch (err) {
+          console.log(`   ⚠️  Gagal recover ${saved.poolName}: ${err}`);
+        }
+      }
+    }
 
     while (this.isRunning) {
       try { await this.cycle(); }
@@ -170,6 +230,7 @@ export class DLMMAgent {
     if (ok) {
       this.tracker.removePosition(pos.positionKey.publicKey.toBase58());
       await this.telegram.alertPositionClosed(pos, status.pnlPercent, status.feeEarned, reason);
+      savePositions(this.activePositions.filter((_, i) => i !== idx));
     }
     return ok;
   }
@@ -240,6 +301,7 @@ export class DLMMAgent {
       this.activePositions.push(newPos);
       this.tracker.addPosition(newPos, momentum.currentPrice);
       await this.telegram.alertPositionOpened(newPos, decision);
+      savePositions(this.activePositions);
       console.log(`  ✅ Posisi dibuka: ${targetPool.name} | ${solAmount.toFixed(3)} SOL`);
     }
   }
@@ -289,7 +351,6 @@ ${formatBundlerReportForAI(bundler)}
 
 === VOLATILITAS ===
 ${formatVolatilityForAI(vol)}
-
 
 
 ${consensus ? `=== CONSENSUS SIGNAL ===
