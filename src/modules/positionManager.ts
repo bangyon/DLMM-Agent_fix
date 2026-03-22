@@ -30,6 +30,10 @@ export interface PositionStatus {
   feeEarned: number;
   isInRange: boolean;
   activeBinId: number;
+  solConvertedToToken: boolean;   // SOL habis → jadi token (price turun keluar range kiri)
+  tokenConvertedToSol: boolean;   // token habis → jadi SOL (price naik keluar range kanan)
+  totalSolInPosition: number;
+  totalTokenInPosition: number;
 }
 
 function toStrategyType(s: string | undefined): StrategyType {
@@ -37,10 +41,6 @@ function toStrategyType(s: string | undefined): StrategyType {
     case 'BidAsk':
     case 'BidAskImBalanced':
       return StrategyType.BidAsk;
-    case 'Spot':
-    case 'SPOT_PUMP':
-    case 'SPOT_DUMP':
-      return StrategyType.Spot;
     case 'Curve':  return StrategyType.Curve;
     case 'Spot':   return StrategyType.Spot;
     default:       return StrategyType.BidAsk; // default BidAsk untuk meme
@@ -180,7 +180,22 @@ export async function checkPositionStatus(
     const feeY = Number(myPos.positionData.feeY || 0) / LAMPORTS_PER_SOL;
     const feeEarned = feeX + feeY;
 
-    return { position, currentValue, pnlPercent, feeEarned, isInRange, activeBinId: activeBin.binId };
+    // Detect apakah SOL sudah terkonversi semua ke token (out of range ke kiri)
+    // positionXAmount = token meme, positionYAmount = SOL
+    const binData = myPos.positionData.positionBinData || [];
+    const totalSolInPosition = binData.reduce((sum: number, b: any) => sum + Number(b.positionYAmount || 0), 0);
+    const totalTokenInPosition = binData.reduce((sum: number, b: any) => sum + Number(b.positionXAmount || 0), 0);
+    const solConvertedToToken = totalSolInPosition === 0 && totalTokenInPosition > 0;
+    const tokenConvertedToSol = totalTokenInPosition === 0 && totalSolInPosition > 0;
+
+    return {
+      position, currentValue, pnlPercent, feeEarned, isInRange,
+      activeBinId: activeBin.binId,
+      solConvertedToToken,   // true = SOL habis → semua jadi token (out of range kiri)
+      tokenConvertedToSol,   // true = token habis → semua jadi SOL (out of range kanan)
+      totalSolInPosition: totalSolInPosition / LAMPORTS_PER_SOL,
+      totalTokenInPosition,
+    };
   } catch (err) {
     console.error(`⚠️  Gagal cek status posisi:`, err);
     return null;
