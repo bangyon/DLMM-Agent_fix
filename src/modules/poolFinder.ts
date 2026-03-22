@@ -97,6 +97,13 @@ async function fetchJson(url: string): Promise<any> {
   return res.json();
 }
 
+// Fetch dari pagination endpoint (lebih efisien — sudah sorted, tidak perlu 138K pools)
+async function fetchTopPoolsPaginated(sortKey: string, limit = 50): Promise<any[]> {
+  const url = `https://dlmm-api.meteora.ag/pair/all_with_pagination?page=0&limit=${limit}&sort_key=${sortKey}&order_by=desc`;
+  const data = await fetchJson(url);
+  return data.pairs || [];
+}
+
 function calcFeeMomentum(fees6h: number, fees24h: number): number {
   if (fees24h === 0) return 0;
   const ratio = (fees6h / fees24h) * 4;
@@ -133,18 +140,26 @@ function calcMemeScore(
 function normalizePool(p: any): PoolInfo {
   const name: string = p.name || '';
   const parts = name.includes('-') ? name.split('-') : ['X', 'Y'];
-  const v24h  = Number(p.volume?.hour_24 || p.trade_volume_24h || 0);
+  const v24h  = Number(p.trade_volume_24h || p.volume?.hour_24 || 0);
   const v6h   = Number(p.volume?.hour_6  || 0);
-  const f24h  = Number(p.fees?.hour_24   || p.fees_24h || 0);
+  const v1h   = Number(p.volume?.hour_1  || 0);
+  const f24h  = Number(p.fees_24h || p.fees?.hour_24 || 0);
   const f6h   = Number(p.fees?.hour_6    || 0);
+  const f1h   = Number(p.fees?.hour_1    || 0);
   const apr   = Number(p.apr || 0);
+  // TVL dari liquidity field (USD) — lebih akurat dari raw lamports
+  const tvlUsd = parseFloat(p.liquidity || '0');
+  // Fallback ke raw reserves kalau liquidity tidak ada
   const reserveX = Number(p.reserve_x_amount || 0);
   const reserveY = Number(p.reserve_y_amount || 0);
-  const tvl   = reserveX + reserveY;
+  const tvl   = tvlUsd > 0 ? tvlUsd : (reserveX + reserveY);
   const bs    = Number(p.bin_step || 0);
 
-  // Volume/TVL ratio — KEY metric untuk meme
-  const volTvlRatio = tvl > 0 ? v24h / tvl : 0;
+  // Volume/TVL ratio — pakai 1h untuk detect trending cepat
+  // Kalau v1h tidak ada, fallback ke 24h/24
+  const volTvlRatio1h = tvlUsd > 0 && v1h > 0 ? v1h / tvlUsd : 0;
+  const volTvlRatio24h = tvlUsd > 0 && v24h > 0 ? v24h / tvlUsd : 0;
+  const volTvlRatio = volTvlRatio1h > 0 ? volTvlRatio1h : volTvlRatio24h / 24;
   const mom   = calcFeeMomentum(f6h, f24h || apr);
   const age   = p.created_at
     ? (Date.now() - new Date(p.created_at * 1000).getTime()) / 3600000
@@ -179,9 +194,25 @@ function normalizePool(p: any): PoolInfo {
 }
 
 export async function getTopPools(limit = 30): Promise<PoolInfo[]> {
-  console.log('   Fetching meme pools (vol/TVL ratio strategy)...');
-  const raw: any[] = await fetchJson('https://dlmm-api.meteora.ag/pair/all');
-  console.log(`   Total pool: ${raw.length}`);
+  console.log('   Fetching meme pools (pagination endpoint — sorted by fee/TVL 1h)...');
+  
+  // Fetch dari 3 sort keys berbeda untuk coverage terbaik
+  const [byFee1h, byVol1h, byFee24h] = await Promise.all([
+    fetchTopPoolsPaginated('feetvlratio1h', 50).catch(() => []),
+    fetchTopPoolsPaginated('volume1h', 50).catch(() => []),
+    fetchTopPoolsPaginated('feetvlratio', 50).catch(() => []),
+  ]);
+
+  // Deduplicate by address
+  const seen = new Set<string>();
+  const raw: any[] = [];
+  for (const pool of [...byFee1h, ...byVol1h, ...byFee24h]) {
+    if (pool.address && !seen.has(pool.address)) {
+      seen.add(pool.address);
+      raw.push(pool);
+    }
+  }
+  console.log(`   Total unique pools fetched: ${raw.length} (vs 138K sebelumnya)`);
 
   const pools = raw
     .map(normalizePool)
