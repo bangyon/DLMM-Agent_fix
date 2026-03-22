@@ -32,24 +32,64 @@ const USDT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 
 // MEME LP STRATEGY FILTERS (berdasarkan komunitas LP Army & top traders)
 // Bukan Tokleo yang untuk bluechip — ini untuk meme hunting
+// ── STRATEGY MODES (dari artikel LP Army bear market) ──────────────────────
+// Mode 1: SPOT PUMP  — token sedang pump, range lebar, max hold 2 jam
+// Mode 2: SPOT DUMP  — token dump >50% lalu retrace 10-20%, entry bottom
+// Mode 3: BIASK FLIP — token strong >3 hari, gunakan support/resistance
+
 const MEME_FILTERS = {
-  // Vol/TVL ratio — metric utama
-  // Kondisi market sepi: turunkan threshold
-  minVolTvlRatio: 1.0,        // min 1x (paling basic)
-  hotVolTvlRatio: 10,         // >= 10x = HOT
-  warmVolTvlRatio: 2,         // 2-10x = WARM
-  // Min volume absolut — rendah untuk tangkap pool kecil yang baru launch
-  minVolume24h: 100,          // $100 minimum (tangkap fresh runners)
+  // Token selection (dari artikel):
+  // Min mcap $200K, min 500 holders, volume 50-100K per 5 menit untuk fast play
+  minMarketCapUsd: 200_000,   // $200K min mcap (GMGN filter)
+  minHolders: 500,            // min 500 holders
+  // Vol/TVL ratio
+  minVolTvlRatio: 1.0,
+  hotVolTvlRatio: 10,
+  warmVolTvlRatio: 2,
+  // Min volume 24h
+  minVolume24h: 10_000,       // $10K — filter noise
   // Min TVL
-  minTvl: 10_000,             // $10K minimum (filter low-mc rug)
-  // Bin step untuk meme
+  minTvl: 10_000,             // $10K minimum
+  // Bin step sweet spot
   minBinStep: 80,
   maxBinStep: 200,
-  // Pool age
-  minPoolAgeHours: 0,         // tidak ada minimum (tangkap pool fresh)
-  // APR dari API tidak akurat, skip filter APR
+  // Pool age per strategy
+  minPoolAgeForBidAskFlip: 72, // 3 hari untuk BidAsk Flip (dari artikel)
+  minPoolAgeHours: 0,
   minApr: 0,
 };
+
+// Detect strategy yang cocok berdasarkan kondisi pool
+export type MemeStrategy = 'spot_pump' | 'spot_dump' | 'bidask_flip' | 'skip';
+
+export function detectStrategy(pool: any): { strategy: MemeStrategy; reason: string; maxHoldHours: number; binRangeHint: number } {
+  const ageHours = pool.poolAgeHours || 999;
+  const priceChange1h = pool.priceChange1h || 0;
+  const priceChange24h = pool.priceChange24h || 0;
+  const volTvl = pool.volumeTvlRatio || 0;
+
+  // BidAsk Flip: pool > 3 hari, volume masih ada, harga sideways/stabil
+  if (ageHours >= 72 && volTvl >= 3 && Math.abs(priceChange1h) < 10) {
+    return { strategy: 'bidask_flip', reason: 'Pool >3 hari, stabil, ideal untuk BidAsk Flip', maxHoldHours: 6, binRangeHint: 20 };
+  }
+
+  // Spot Dump: harga turun >50% dari ATH (proxy: 24h change < -40%)
+  if (priceChange24h < -40 && priceChange1h > 5) {
+    return { strategy: 'spot_dump', reason: 'Dump >40% lalu retrace — entry bottom', maxHoldHours: 3, binRangeHint: 30 };
+  }
+
+  // Spot Pump: token sedang pump (1h change positif, volume tinggi)
+  if (priceChange1h > 5 && volTvl >= 5) {
+    return { strategy: 'spot_pump', reason: 'Token pumping dengan volume tinggi', maxHoldHours: 2, binRangeHint: 34 };
+  }
+
+  // Default: spot pump dengan hold pendek
+  if (volTvl >= 2) {
+    return { strategy: 'spot_pump', reason: 'Volume ada, entry dengan range default', maxHoldHours: 2, binRangeHint: 34 };
+  }
+
+  return { strategy: 'skip', reason: 'Tidak ada strategi yang cocok', maxHoldHours: 0, binRangeHint: 0 };
+}
 
 async function fetchJson(url: string): Promise<any> {
   const res = await fetch(url, { headers: { 'Accept': 'application/json' } });

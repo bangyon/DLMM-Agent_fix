@@ -12,7 +12,7 @@ import { startDashboard, updateDashboardState } from '../dashboard/server';
 import { comparePoolBacktests } from '../backtest/simulator';
 import { getTokenMomentum, checkRug, formatMomentumForAI } from '../modules/priceFeed';
 import { PositionTracker } from '../modules/positionTracker';
-import { buildTraderIntelligence, formatIntelligenceForAI, detectExitSignals, TraderIntelligence } from '../modules/topTrader';
+// topTrader intel disabled — fokus ke pool filter dari artikel LP Army
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -24,8 +24,8 @@ export class DLMMAgent {
   private cycleCount = 0;
   private telegram: TelegramAlert;
   private tracker: PositionTracker;
-  private intel: TraderIntelligence | null = null;
-  private lastIntelAt = 0;
+  
+
   private lastPoolFetchAt = 0;
   private pools: PoolInfo[] = [];
 
@@ -73,13 +73,7 @@ export class DLMMAgent {
     const solBal = await this.connection.getBalance(this.wallet.publicKey) / LAMPORTS_PER_SOL;
     console.log(`💰 ${solBal.toFixed(4)} SOL | Posisi: ${this.activePositions.length}/${CONFIG.agent.maxPositions}`);
 
-    // 1. Refresh top trader intelligence setiap 2 menit
-    if (CONFIG.ai.lpAgentApiKey && Date.now() - this.lastIntelAt > 120_000) {
-      this.intel = await buildTraderIntelligence(CONFIG.ai.lpAgentApiKey);
-      this.lastIntelAt = Date.now();
-    }
-
-    // 2. Refresh pool list setiap 30 detik
+    // 1. Refresh pool list setiap 30 detik
     if (Date.now() - this.lastPoolFetchAt > 30_000) {
       this.pools = await getTopPools(30);
       this.lastPoolFetchAt = Date.now();
@@ -129,14 +123,7 @@ export class DLMMAgent {
       if (!status.isInRange) await this.telegram.alertOutOfRange(pos, status.pnlPercent);
       if (status.feeEarned > 0.001) await claimFees(this.connection, this.wallet, pos);
 
-      // A. Top trader exit signal
-      if (this.intel) {
-        const exitSig = detectExitSignals(this.intel, pos.poolAddress);
-        if (exitSig.isExiting) {
-          console.log(`  🚨 Top trader exit: ${exitSig.reason}`);
-          if (await this.close(pos, status, exitSig.reason, i)) { toRemove.push(i); continue; }
-        }
-      }
+  
 
       // B. Tracker-based rules (stop loss, trailing stop, max hold)
       const track = this.tracker.getTrack(key);
@@ -195,20 +182,7 @@ export class DLMMAgent {
     // Skip pool yang sudah ada posisinya
     const openAddrs = new Set(this.activePositions.map(p => p.poolAddress));
 
-    // Prioritas 1: consensus pool dari top traders
-    const consensusCandidates = this.intel?.topPools
-      .filter(c => (c.signal === 'strong_entry' || c.signal === 'entry') && !openAddrs.has(c.pool))
-      .slice(0, 2) || [];
-
-    for (const consensus of consensusCandidates) {
-      const pool = this.pools.find(p => p.address === consensus.pool);
-      if (!pool) continue;
-      console.log(`\n🎯 Consensus pool: ${consensus.pairName} (${consensus.traderCount} top traders)`);
-      await this.evaluatePool(pool, solBal, consensus);
-      if (this.activePositions.length >= CONFIG.agent.maxPositions) return;
-    }
-
-    // Prioritas 2: pool terbaik dari metric (vol/TVL, APR, momentum)
+    // Pool terbaik dari metric (vol/TVL, APR, momentum) — LP Army filter
     for (const pool of topPools.filter(p => !openAddrs.has(p.address)).slice(0, 2)) {
       if (this.activePositions.length >= CONFIG.agent.maxPositions) break;
       await this.evaluatePool(pool, solBal, null);
@@ -272,8 +246,7 @@ export class DLMMAgent {
 
   // ── Prompt builders ────────────────────────────────────────────────────────
   private buildEntryPrompt(pools: any[], bundler: any, vol: any, solBal: number, solAmt: number, momentum: any, rug: any, consensus: any): string {
-    const intelText = this.intel ? formatIntelligenceForAI(this.intel) : 'Intelligence tidak tersedia';
-    const binRange = consensus?.avgBinRange || CONFIG.agent.defaultBinRange;
+      const binRange = consensus?.avgBinRange || CONFIG.agent.defaultBinRange;
     const strategy = consensus?.dominantStrategy || 'BidAskImBalanced';
 
     return `Kamu adalah DLMM LP agent. Putuskan: open_position atau skip?
@@ -284,9 +257,24 @@ SOL untuk posisi ini: ${solAmt.toFixed(3)}
 
 === STRATEGI MEME LP ===
 - FOKUS: Vol/TVL ratio >= 5x, APR >= 50%, pool age 2-48 jam
-- Strategy: SELALU SOL-only one-sided (jangan pernah dual side)
-- Deposit hanya SOL, tidak perlu beli token meme dulu
-- Default bin range: ±${binRange} (dari top traders)
+- Strategy: SELALU SOL-only one-sided (tidak pernah dual side)
+
+3 STRATEGY MODES (dari LP Army bear market guide):
+1. SPOT_PUMP: token sedang pump → range ±34, max hold 2 JAM, exit sebelum MM lelah
+2. SPOT_DUMP: token dump >50% lalu retrace 10-20% → range ±30, max hold 3 jam, entry di bottom
+3. BIDASK_FLIP: pool >3 hari, harga stabil/sideways → range ±20, set di support, flip saat sideways
+
+TOKEN SELECTION (filter ketat dari artikel):
+- Min market cap: $200K
+- Min holders: 500
+- Volume 50-100K/5 menit untuk fast play, 10-20K untuk strong runner
+- Cek narasi: viral? memeable? bukan politik? bukan revamp token?
+- Default bin range: ±${binRange}
+
+BEAR MARKET RULES:
+- Jangan hold >2 jam untuk degen play (MM bisa capek kapan saja)
+- BidAsk Flip hanya untuk pool >3 hari yang terbukti survive
+- Single-side SOL selalu — tidak perlu beli token
 - JANGAN skip hanya karena FMS rendah — vol/TVL lebih penting
 - Entry kalau 3 dari 5 terpenuhi: vol/TVL>=5x, APR>=50%, age 2-48h, FMS>20, top trader signal
 
@@ -302,7 +290,7 @@ ${formatBundlerReportForAI(bundler)}
 === VOLATILITAS ===
 ${formatVolatilityForAI(vol)}
 
-${intelText}
+
 
 ${consensus ? `=== CONSENSUS SIGNAL ===
 Pool ini dimasuki ${consensus.traderCount} top traders!

@@ -10,7 +10,8 @@ export interface PositionTrack {
   rebalanceCount: number;
 }
 
-const MAX_HOLD_HOURS = 12;          // LP Army: close 2x sehari = max ~12 jam
+const MAX_HOLD_HOURS_DEFAULT = 2;
+const MAX_HOLD_HOURS_BIDASK = 6;
 const TRAILING_STOP_PCT = 15;       // Close jika harga turun 15% dari peak
 const MIN_REBALANCE_INTERVAL = 2;   // Minimal 2 jam antara rebalance
 
@@ -49,11 +50,14 @@ export class PositionTracker {
     const track = this.tracks.get(positionKey);
     if (!track) return { should: false, reason: '' };
 
-    // 1. Max hold duration (LP Army style: tutup setelah 12 jam)
-    if (track.hoursHeld >= MAX_HOLD_HOURS) {
+    // 1. Max hold duration — bear market: lebih pendek
+    // BidAsk Flip: 6 jam, Spot play: 2 jam
+    const isBidAsk = track.position.strategyType?.toString().includes('BidAsk');
+    const maxHold = isBidAsk ? MAX_HOLD_HOURS_BIDASK : MAX_HOLD_HOURS_DEFAULT;
+    if (track.hoursHeld >= maxHold) {
       return {
         should: true,
-        reason: `Max hold ${MAX_HOLD_HOURS}h tercapai (${track.hoursHeld.toFixed(1)}h). Lock profit & re-enter fresh.`,
+        reason: `Max hold ${maxHold}h tercapai (${track.hoursHeld.toFixed(1)}h) — lock profit, re-enter fresh`,
       };
     }
 
