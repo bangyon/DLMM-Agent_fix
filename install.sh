@@ -29,14 +29,15 @@ fi
 echo -e "${GREEN}✅ Node.js $(node -v) detected${NC}"
 
 # Clone atau update repo
-if [ -d "dlmm-agent-test" ]; then
+INSTALL_DIR="dlmm-agent"
+if [ -d "$INSTALL_DIR" ]; then
   echo -e "${YELLOW}📦 Folder sudah ada, update...${NC}"
-  cd dlmm-agent-test
+  cd $INSTALL_DIR
   git pull origin main
 else
   echo -e "${YELLOW}📦 Cloning repo...${NC}"
-  git clone https://github.com/bangyon/dlmm-agent-test.git
-  cd dlmm-agent-test
+  git clone https://github.com/bangyon/dlmm-agent-test.git $INSTALL_DIR
+  cd $INSTALL_DIR
 fi
 
 # Install dependencies
@@ -107,8 +108,11 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║     ✅ Install selesai!                 ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
 echo ""
+# Detect folder name (repo name)
+REPO_DIR=$(basename $(git remote get-url origin 2>/dev/null || echo "dlmm-agent-test") .git)
+
 echo -e "Jalankan bot dengan:"
-echo -e "${BLUE}  cd dlmm-agent-test && npm run dev${NC}"
+echo -e "${BLUE}  cd $REPO_DIR && npm run dev${NC}"
 echo ""
 echo -e "Dashboard: ${BLUE}http://localhost:3000${NC}"
 echo ""
