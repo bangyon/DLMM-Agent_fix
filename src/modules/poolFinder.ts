@@ -43,7 +43,7 @@ const MEME_FILTERS = {
   minMarketCapUsd: 200_000,   // $200K min mcap (GMGN filter)
   minHolders: 500,            // min 500 holders
   // Vol/TVL ratio
-  minVolTvlRatio: 1.0,
+  minVolTvlRatio: 3.0,
   hotVolTvlRatio: 10,
   warmVolTvlRatio: 2,
   // Min volume 24h
