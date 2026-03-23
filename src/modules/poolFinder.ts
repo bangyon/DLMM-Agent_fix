@@ -1,4 +1,8 @@
-import { CONFIG } from '../config';
+// Pool Discovery menggunakan Meteora Pool Discovery API
+// Source: https://pool-discovery-api.datapi.meteora.ag
+// Jauh lebih akurat dari /pair/all — include organic score, holders, mcap, volatility
+
+const DISCOVERY_API = 'https://pool-discovery-api.datapi.meteora.ag';
 
 export interface PoolInfo {
   address: string;
@@ -8,282 +12,235 @@ export interface PoolInfo {
   binStep: number;
   feeRate: number;
   tvl: number;
-  volume24h: number;
-  volume6h: number;
-  fees24h: number;
-  fees6h: number;
+  activeTvl: number;
+  volume: number;
+  feeWindow: number;
+  feeActiveTvlRatio: number;
+  volatility: number;
+  organicScore: number;
+  holders: number;
+  marketCapUsd: number;
+  priceTrend: number[];
+  priceChangePct: number;
+  uniqueTraders: number;
+  swapCount: number;
+  warnings: number;
+  activePositions: number;
+  // Computed
+  volumeTvlRatio: number;
+  compositeScore: number;
+  tier: 'hot' | 'warm' | 'cold';
+  strategy: MemeStrategy;
+  maxHoldHours: number;
+  binRangeHint: number;
+  poolAgeHours: number;
   feeApr24h: number;
   feeMomentumScore: number;
-  compositeScore: number;
-  volumeTvlRatio: number;    // KEY METRIC untuk meme: vol/TVL > 10x = hot pool
-  activeBinId: number;
-  currentPrice: number;
-  volatility: 'low' | 'medium' | 'high';
-  tier: 'hot' | 'warm' | 'cold';
-  poolAgeHours: number;
-  isVerified: boolean;
-  marketCapUsd: number;
-  liquidityUsd: number;
 }
 
-const SOL  = 'So11111111111111111111111111111111111111112';
-const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-const USDT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
-
-// MEME LP STRATEGY FILTERS (berdasarkan komunitas LP Army & top traders)
-// Bukan Tokleo yang untuk bluechip — ini untuk meme hunting
-// ── STRATEGY MODES (dari artikel LP Army bear market) ──────────────────────
-// Mode 1: SPOT PUMP  — token sedang pump, range lebar, max hold 2 jam
-// Mode 2: SPOT DUMP  — token dump >50% lalu retrace 10-20%, entry bottom
-// Mode 3: BIASK FLIP — token strong >3 hari, gunakan support/resistance
-
-const MEME_FILTERS = {
-  // Token selection (dari artikel):
-  // Min mcap $200K, min 500 holders, volume 50-100K per 5 menit untuk fast play
-  minMarketCapUsd: 200_000,   // $200K min mcap (GMGN filter)
-  minHolders: 500,            // min 500 holders
-  // Vol/TVL ratio
-  minVolTvlRatio: 0.5,
-  hotVolTvlRatio: 10,
-  warmVolTvlRatio: 2,
-  // Min volume 24h
-  minVolume24h: 500,   // pakai vol1h, threshold rendah       // $10K — filter noise
-  // Min TVL
-  minTvl: 50,             // TVL dari API tidak akurat, threshold sangat rendah             // $10K minimum
-  // Bin step sweet spot
-  minBinStep: 20,          // turunkan untuk tangkap lebih banyak pool
-  maxBinStep: 200,
-  // Pool age per strategy
-  minPoolAgeForBidAskFlip: 72, // 3 hari untuk BidAsk Flip (dari artikel)
-  minPoolAgeHours: 0,
-  minApr: 0,
-};
-
-// Detect strategy yang cocok berdasarkan kondisi pool
 export type MemeStrategy = 'spot_pump' | 'spot_dump' | 'bidask_flip' | 'skip';
 
-export function detectStrategy(pool: any): { strategy: MemeStrategy; reason: string; maxHoldHours: number; binRangeHint: number } {
-  const ageHours = pool.poolAgeHours || 999;
-  const priceChange1h = pool.priceChange1h || 0;
-  const priceChange24h = pool.priceChange24h || 0;
-  const volTvl = pool.volumeTvlRatio || 0;
+// Filter defaults — align dengan Meridian config
+const FILTERS = {
+  minMcap:          150_000,   // $150K
+  maxMcap:        10_000_000,  // $10M (skip yang sudah terlalu besar)
+  minHolders:         500,
+  minTvl:          10_000,
+  maxTvl:         500_000,
+  minBinStep:          80,
+  maxBinStep:         125,
+  minOrganic:          65,     // organic score minimum
+  minFeeActiveTvlRatio: 0.02,  // 0.02% per timeframe
+  timeframe:          '30m',
+  category:        'trending',
+};
 
-  // BidAsk Flip: pool > 3 hari, volume masih ada, harga sideways/stabil
-  if (ageHours >= 72 && volTvl >= 3 && Math.abs(priceChange1h) < 10) {
-    return { strategy: 'bidask_flip', reason: 'Pool >3 hari, stabil, ideal untuk BidAsk Flip', maxHoldHours: 6, binRangeHint: 20 };
-  }
+const BLACKLIST = new Set([
+  'OPTIGUY-SOL', 'GECKY-SOL', 'OPTIMUSK-SOL', // known rugs
+]);
 
-  // Spot Dump: harga turun >50% dari ATH (proxy: 24h change < -40%)
-  if (priceChange24h < -40 && priceChange1h > 5) {
-    return { strategy: 'spot_dump', reason: 'Dump >40% lalu retrace — entry bottom', maxHoldHours: 3, binRangeHint: 30 };
-  }
+async function fetchDiscoveryAPI(pageSize = 50, extraFilters = ''): Promise<any[]> {
+  const base = [
+    'pool_type=dlmm',
+    'base_token_has_critical_warnings=false',
+    'quote_token_has_critical_warnings=false',
+    'base_token_has_high_single_ownership=false',
+    `base_token_market_cap>=${FILTERS.minMcap}`,
+    `base_token_market_cap<=${FILTERS.maxMcap}`,
+    `base_token_holders>=${FILTERS.minHolders}`,
+    `tvl>=${FILTERS.minTvl}`,
+    `tvl<=${FILTERS.maxTvl}`,
+    `dlmm_bin_step>=${FILTERS.minBinStep}`,
+    `dlmm_bin_step<=${FILTERS.maxBinStep}`,
+    `base_token_organic_score>=${FILTERS.minOrganic}`,
+    `fee_active_tvl_ratio>=${FILTERS.minFeeActiveTvlRatio}`,
+  ];
 
-  // Spot Pump: token sedang pump (1h change positif, volume tinggi)
-  if (priceChange1h > 5 && volTvl >= 5) {
-    return { strategy: 'spot_pump', reason: 'Token pumping dengan volume tinggi', maxHoldHours: 2, binRangeHint: 34 };
-  }
+  const filterStr = [...base, ...extraFilters ? [extraFilters] : []].join('&&');
+  const url = `${DISCOVERY_API}/pools?page_size=${pageSize}&filter_by=${encodeURIComponent(filterStr)}&timeframe=${FILTERS.timeframe}&category=${FILTERS.category}`;
 
-  // Default: spot pump dengan hold pendek
-  if (volTvl >= 2) {
-    return { strategy: 'spot_pump', reason: 'Volume ada, entry dengan range default', maxHoldHours: 2, binRangeHint: 34 };
-  }
-
-  return { strategy: 'skip', reason: 'Tidak ada strategi yang cocok', maxHoldHours: 0, binRangeHint: 0 };
-}
-
-async function fetchJson(url: string): Promise<any> {
   const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  if (!res.ok) throw new Error(`Discovery API ${res.status}`);
+  const data = await res.json() as any;
+  return data.data || [];
 }
 
-// Fetch dari pagination endpoint (lebih efisien — sudah sorted, tidak perlu 138K pools)
-async function fetchTopPoolsPaginated(sortKey: string, limit = 50): Promise<any[]> {
-  const url = `https://dlmm-api.meteora.ag/pair/all_with_pagination?page=0&limit=${limit}&sort_key=${sortKey}&order_by=desc`;
-  const data = await fetchJson(url);
-  return data.pairs || [];
+function detectStrategy(p: any, organic: number, feeRatio: number): {
+  strategy: MemeStrategy; maxHoldHours: number; binRangeHint: number
+} {
+  const trend = (p.price_trend || []) as number[];
+  const recentTrend = trend.slice(-3).reduce((a: number, b: number) => a + b, 0);
+  const priceChange = p.pool_price_change_pct || 0;
+
+  // BidAsk Flip: organic tinggi, volume stabil, tidak sedang pump/dump
+  if (organic >= 75 && Math.abs(priceChange) < 15 && feeRatio > 0.05) {
+    return { strategy: 'bidask_flip', maxHoldHours: 6, binRangeHint: 20 };
+  }
+
+  // Spot Dump: price turun tapi mulai recovery (trend naik dari bawah)
+  if (priceChange < -20 && recentTrend > 0) {
+    return { strategy: 'spot_dump', maxHoldHours: 3, binRangeHint: 30 };
+  }
+
+  // Spot Pump: price naik, volume tinggi
+  if (priceChange > 5 || feeRatio > 0.1) {
+    return { strategy: 'spot_pump', maxHoldHours: 2, binRangeHint: 34 };
+  }
+
+  return { strategy: 'spot_pump', maxHoldHours: 2, binRangeHint: 34 };
 }
 
-function calcFeeMomentum(fees6h: number, fees24h: number): number {
-  if (fees24h === 0) return 0;
-  const ratio = (fees6h / fees24h) * 4;
-  return Math.min(100, Math.round(ratio * 50));
-}
+function calcCompositeScore(p: PoolInfo): number {
+  // Organic score (40 poin max) — filter utama
+  const organicScore = Math.min(40, (p.organicScore / 100) * 40);
+  // Fee/TVL ratio (30 poin max) — yield
+  const feeScore = Math.min(30, p.feeActiveTvlRatio * 200);
+  // Volume (20 poin max) — aktivitas
+  const volScore = Math.min(20, (p.volume / 10000) * 10);
+  // Holders (10 poin) — distribusi sehat
+  const holderScore = Math.min(10, (p.holders / 1000) * 5);
 
-// Composite score khusus meme LP strategy
-function calcMemeScore(
-  apr: number,
-  volTvlRatio: number,
-  feeMomentum: number,
-  binStep: number,
-  poolAgeHours: number
-): number {
-  // 1. Volume/TVL ratio — metric utama untuk meme (40 poin max)
-  const volScore = Math.min(40, volTvlRatio * 2);
-
-  // 2. APR — fee per SOL deposited (30 poin max)
-  const aprScore = Math.min(30, apr * 0.1);
-
-  // 3. Fee momentum — apakah volume sedang naik? (20 poin max)
-  const momScore = feeMomentum * 0.2;
-
-  // 4. Bin step sweet spot untuk meme: 80-150 optimal (10 poin)
-  const binScore = binStep >= 80 && binStep <= 150 ? 10 : binStep <= 200 ? 5 : 0;
-
-  // 5. Pool age bonus: fresh runner 2-24 jam = bonus (pool baru = volume masih tinggi)
-  const ageBonus = poolAgeHours >= 2 && poolAgeHours <= 24 ? 5
-    : poolAgeHours <= 48 ? 3 : 0;
-
-  return Math.round(volScore + aprScore + momScore + binScore + ageBonus);
+  return Math.round(organicScore + feeScore + volScore + holderScore);
 }
 
 function normalizePool(p: any): PoolInfo {
-  const name: string = p.name || '';
-  const parts = name.includes('-') ? name.split('-') : ['X', 'Y'];
-  const v24h  = Number(p.trade_volume_24h || p.volume?.hour_24 || 0);
-  const v6h   = Number(p.volume?.hour_6  || 0);
-  const v1h   = Number(p.volume?.hour_1  || 0);
-  const f24h  = Number(p.fees_24h || p.fees?.hour_24 || 0);
-  const f6h   = Number(p.fees?.hour_6    || 0);
-  const f1h   = Number(p.fees?.hour_1    || 0);
-  const apr   = Number(p.apr || 0);
-  // TVL dari liquidity field (USD) — lebih akurat dari raw lamports
-  const tvlUsd = parseFloat(p.liquidity || '0');
-  // Fallback ke raw reserves kalau liquidity tidak ada
-  const reserveX = Number(p.reserve_x_amount || 0);
-  const reserveY = Number(p.reserve_y_amount || 0);
-  const tvl   = tvlUsd > 0 ? tvlUsd : (reserveX + reserveY);
-  const bs    = Number(p.bin_step || 0);
+  const tokenX = p.token_x || {};
+  const tokenY = p.token_y || {};
+  const organic = Math.round(p.token_x?.organic_score || 0);
+  const feeRatio = p.fee_active_tvl_ratio || 0;
+  const tvl = p.tvl || 0;
+  const vol = p.volume || 0;
+  const volTvlRatio = tvl > 0 ? vol / tvl : 0;
 
-  // Volume/TVL ratio — pakai 1h untuk detect trending cepat
-  // Kalau v1h tidak ada, fallback ke 24h/24
-  const volTvlRatio1h = tvlUsd > 0 && v1h > 0 ? v1h / tvlUsd : 0;
-  const volTvlRatio24h = tvlUsd > 0 && v24h > 0 ? v24h / tvlUsd : 0;
-  const volTvlRatio = volTvlRatio1h > 0 ? volTvlRatio1h : volTvlRatio24h / 24;
-  const mom   = calcFeeMomentum(f6h, f24h || apr);
-  const age   = p.created_at
-    ? (Date.now() - new Date(p.created_at * 1000).getTime()) / 3600000
-    : 999;
-  const score = calcMemeScore(apr, volTvlRatio, mom, bs, age);
+  const { strategy, maxHoldHours, binRangeHint } = detectStrategy(p, organic, feeRatio);
 
-  return {
-    address:          p.address || '',
-    name,
-    tokenX: { mint: p.mint_x || '', symbol: parts[0] || 'X', decimals: 9 },
-    tokenY: { mint: p.mint_y || '', symbol: parts[1] || 'Y', decimals: 6 },
-    binStep:          bs,
-    feeRate:          parseFloat(p.base_fee_percentage || '0') * 100,
+  const pool: PoolInfo = {
+    address:          p.pool_address || '',
+    name:             p.name || '',
+    tokenX: { mint: tokenX.address || '', symbol: tokenX.symbol || 'X', decimals: 9 },
+    tokenY: { mint: tokenY.address || '', symbol: tokenY.symbol || 'SOL', decimals: 9 },
+    binStep:          p.dlmm_params?.bin_step || 0,
+    feeRate:          p.fee_pct || 0,
     tvl,
-    volume24h:        v24h,
-    volume6h:         v6h,
-    fees24h:          f24h,
-    fees6h:           f6h,
-    feeApr24h:        apr,
-    feeMomentumScore: mom,
-    compositeScore:   score,
+    activeTvl:        p.active_tvl || 0,
+    volume:           vol,
+    feeWindow:        p.fee || 0,
+    feeActiveTvlRatio: feeRatio,
+    volatility:       p.volatility || 0,
+    organicScore:     organic,
+    holders:          p.base_token_holders || 0,
+    marketCapUsd:     tokenX.market_cap || 0,
+    priceTrend:       p.price_trend || [],
+    priceChangePct:   p.pool_price_change_pct || 0,
+    uniqueTraders:    p.unique_traders || 0,
+    swapCount:        p.swap_count || 0,
+    warnings:         tokenX.warnings?.length || 0,
+    activePositions:  p.active_positions || 0,
     volumeTvlRatio:   volTvlRatio,
-    activeBinId:      0,
-    currentPrice:     Number(p.current_price || 0),
-    volatility:       bs <= 20 ? 'low' : bs <= 80 ? 'medium' : 'high',
-    tier:             score >= 60 ? 'hot' : score >= 30 ? 'warm' : 'cold',
-    poolAgeHours:     age,
-    isVerified:       p.is_verified || false,
-    marketCapUsd:     0,
-    liquidityUsd:     tvl,
+    compositeScore:   0, // calculated below
+    tier:             'cold',
+    strategy,
+    maxHoldHours,
+    binRangeHint,
+    poolAgeHours:     999,
+    feeApr24h:        feeRatio * 48, // 30m → 24h estimate
+    feeMomentumScore: Math.min(100, feeRatio * 500),
   };
+
+  pool.compositeScore = calcCompositeScore(pool);
+  pool.tier = pool.compositeScore >= 60 ? 'hot' : pool.compositeScore >= 30 ? 'warm' : 'cold';
+
+  return pool;
 }
 
-export async function getTopPools(limit = 30): Promise<PoolInfo[]> {
-  console.log('   Fetching meme pools (pagination endpoint — sorted by fee/TVL 1h)...');
-  
-  // Fetch dari 3 sort keys berbeda untuk coverage terbaik
-  const [byFee1h, byVol1h, byFee24h] = await Promise.all([
-    fetchTopPoolsPaginated('feetvlratio1h', 50).catch(() => []),
-    fetchTopPoolsPaginated('volume1h', 50).catch(() => []),
-    fetchTopPoolsPaginated('feetvlratio', 50).catch(() => []),
-  ]);
+export async function getTopPools(limit = 20): Promise<PoolInfo[]> {
+  console.log(`   Fetching pools via Discovery API (organic≥${FILTERS.minOrganic}, mcap $${FILTERS.minMcap/1000}K-$${FILTERS.maxMcap/1000000}M, holders≥${FILTERS.minHolders})...`);
 
-  // Deduplicate by address
-  const seen = new Set<string>();
-  const raw: any[] = [];
-  for (const pool of [...byFee1h, ...byVol1h, ...byFee24h]) {
-    if (pool.address && !seen.has(pool.address)) {
-      seen.add(pool.address);
-      raw.push(pool);
-    }
+  let raw: any[] = [];
+  try {
+    // Fetch trending dengan filter ketat
+    raw = await fetchDiscoveryAPI(50);
+    console.log(`   Discovery API: ${raw.length} pools (filtered server-side)`);
+  } catch (err) {
+    console.log(`   Discovery API failed: ${err} — fallback ke pagination`);
+    // Fallback ke endpoint lama
+    const res = await fetch('https://dlmm-api.meteora.ag/pair/all_with_pagination?page=0&limit=50&sort_key=feetvlratio1h&order_by=desc');
+    const data = await res.json() as any;
+    raw = data.pairs || [];
+    console.log(`   Fallback: ${raw.length} pools`);
   }
-  console.log(`   Total unique pools fetched: ${raw.length} (vs 138K sebelumnya)`);
 
+  const SOL = 'So11111111111111111111111111111111111111112';
   const pools = raw
     .map(normalizePool)
     .filter(p => {
       if (!p.address) return false;
-
-      // Wajib SOL di salah satu sisi
-      const hasSOL = p.tokenX.mint === SOL || p.tokenY.mint === SOL;
+      if (BLACKLIST.has(p.name)) return false;
+      // Harus punya SOL sebagai quote token
+      const hasSOL = p.tokenX.mint === SOL || p.tokenY.mint === SOL ||
+        p.name.includes('-SOL') || p.name.includes('SOL-');
       if (!hasSOL) return false;
-
-      // Skip stable pairs — fokus meme
-      const isStable =
-        [USDC, USDT].includes(p.tokenX.mint) && [USDC, USDT].includes(p.tokenY.mint);
-      if (isStable) return false;
-
-      // Bin step range untuk meme
-      if (p.binStep < MEME_FILTERS.minBinStep || p.binStep > MEME_FILTERS.maxBinStep) return false;
-
-      // Filter utama: harus ada volume
-      if (p.volume24h < MEME_FILTERS.minVolume24h) return false;
-
-      // Min TVL
-      if (p.tvl < MEME_FILTERS.minTvl) return false;
-
-      // Min vol/TVL ratio
-      if (p.volumeTvlRatio < MEME_FILTERS.minVolTvlRatio) return false;
-
-      // Skip low market cap — rug risk tinggi
-      // Market cap akan di-enrich via DexScreener setelah filter awal
-      // Untuk sementara: skip pool dengan TVL sangat kecil (proxy mcap)
-      if (p.tvl < 10_000) return false;  // min $10K TVL = ada liquidity serius
-
+      // Skip jika ada critical warnings
+      if (p.warnings > 0) return false;
       return true;
     })
     .sort((a, b) => b.compositeScore - a.compositeScore)
     .slice(0, limit);
 
-  const hot  = pools.filter(p => p.tier === 'hot').length;
+  const hot = pools.filter(p => p.tier === 'hot').length;
   const warm = pools.filter(p => p.tier === 'warm').length;
-  console.log(`   Meme pools qualified: ${pools.length} (hot: ${hot}, warm: ${warm})`);
+  console.log(`   Qualified: ${pools.length} (hot: ${hot}, warm: ${warm})`);
 
   if (pools.length > 0) {
-    console.log(`   Top pool: ${pools[0].name} | vol/TVL: ${pools[0].volumeTvlRatio.toFixed(1)}x | APR: ${pools[0].feeApr24h.toFixed(0)}%`);
+    const top = pools[0];
+    console.log(`   Top: ${top.name} | organic:${top.organicScore} | holders:${top.holders} | fee/tvl:${top.feeActiveTvlRatio.toFixed(4)} | strategy:${top.strategy}`);
   }
 
   return pools;
 }
 
 export function rankPools(pools: PoolInfo[]): PoolInfo[] {
-  return [...pools]
-    .sort((a, b) => b.compositeScore - a.compositeScore)
-    .slice(0, 5);
+  return [...pools].sort((a, b) => b.compositeScore - a.compositeScore).slice(0, 5);
 }
 
-// LP Army allocation: hot pool = 1.5x, warm = 1x
 export function getSolAllocationMultiplier(pool: PoolInfo): number {
-  if (pool.tier === 'hot' && pool.volumeTvlRatio >= 20) return 1.5;
+  if (pool.organicScore >= 85 && pool.feeActiveTvlRatio > 0.1) return 1.5;
   if (pool.tier === 'hot') return 1.25;
   return 1.0;
 }
 
 export function formatPoolsForAI(pools: PoolInfo[]): string {
   return pools.map((p, i) => `
-Pool ${i + 1}: ${p.name} [${p.tier.toUpperCase()}]
+Pool ${i+1}: ${p.name} [${p.tier.toUpperCase()}] — Strategy: ${p.strategy}
   Address: ${p.address}
-  Bin Step: ${p.binStep}
-  APR: ${p.feeApr24h.toFixed(0)}% | Volume 24h: $${p.volume24h.toLocaleString()}
-  TVL: $${p.tvl.toLocaleString()} | Vol/TVL Ratio: ${p.volumeTvlRatio.toFixed(1)}x ${p.volumeTvlRatio >= 10 ? '🔥 HOT' : p.volumeTvlRatio >= 5 ? '✅ WARM' : ''}
-  Fee Momentum: ${p.feeMomentumScore}/100
-  Pool age: ${p.poolAgeHours === 999 ? 'unknown' : p.poolAgeHours.toFixed(1) + 'h'}
-  Meme Score: ${p.compositeScore}/100
-  SOL multiplier: ${getSolAllocationMultiplier(p)}x
+  Bin Step: ${p.binStep} | Fee Rate: ${p.feeRate}%
+  Organic Score: ${p.organicScore}/100 | Holders: ${p.holders.toLocaleString()} | MCap: $${(p.marketCapUsd/1000).toFixed(0)}K
+  Fee/TVL Ratio: ${p.feeActiveTvlRatio.toFixed(4)} | Volume: $${p.volume.toFixed(0)}
+  Volatility: ${p.volatility.toFixed(2)} | Price Change: ${p.priceChangePct.toFixed(1)}%
+  Warnings: ${p.warnings} | Active Positions: ${p.activePositions}
+  Composite Score: ${p.compositeScore}/100 | Max Hold: ${p.maxHoldHours}h
 `).join('\n');
 }
+
+// Untuk detectStrategy export
+export { detectStrategy };

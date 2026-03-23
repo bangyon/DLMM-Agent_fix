@@ -13,6 +13,7 @@ import { startDashboard, updateDashboardState } from '../dashboard/server';
 import { comparePoolBacktests } from '../backtest/simulator';
 import { getTokenMomentum, checkRug, formatMomentumForAI } from '../modules/priceFeed';
 import { PositionTracker } from '../modules/positionTracker';
+import { recordPerformance, getLessonsForPrompt, getPerformanceSummary } from '../modules/lessons';
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -74,7 +75,12 @@ export class DLMMAgent {
   private stream: any = null;
 
   constructor() {
-    this.connection = new Connection(CONFIG.rpc.url, 'confirmed');
+    // pump.helius.com lebih cepat untuk meme tokens
+    const rpcUrl = CONFIG.rpc.url.includes('helius') 
+      ? CONFIG.rpc.url.replace('mainnet.helius', 'pump.helius')
+      : CONFIG.rpc.url;
+    this.connection = new Connection(rpcUrl, 'confirmed');
+    console.log(`   RPC: ${rpcUrl.split('?')[0]}`);
     this.wallet = Keypair.fromSecretKey(bs58.decode(CONFIG.wallet.privateKey));
     this.telegram = new TelegramAlert();
     this.tracker = new PositionTracker();
@@ -173,11 +179,6 @@ export class DLMMAgent {
     const solBal = await this.connection.getBalance(this.wallet.publicKey) / LAMPORTS_PER_SOL;
     console.log(`💰 ${solBal.toFixed(4)} SOL | Posisi: ${this.activePositions.length}/${CONFIG.agent.maxPositions}`);
 
-    // Skip scan kalau ada posisi aktif
-    if (this.activePositions.length >= CONFIG.agent.maxPositions) {
-      return;
-    }
-
     // Refresh pool list setiap 30 detik
     if (Date.now() - this.lastPoolFetchAt > 30_000) {
       this.pools = await getTopPools(30);
@@ -260,12 +261,12 @@ export class DLMMAgent {
       });
 
       if (!status.isInRange) await this.telegram.alertOutOfRange(pos, status.pnlPercent);
-      
+      if (status.feeEarned > 0.001) await claimFees(this.connection, this.wallet, pos);
 
       // ── BidAsk Flip: SOL terkonversi semua ke token ──────────────────────
       if (status.solConvertedToToken && !status.isInRange) {
         console.log(`\n🔄 BidAsk FLIP: ${pos.poolName} — SOL habis jadi token, reopen token-side`);
-        
+        if (status.feeEarned > 0) await claimFees(this.connection, this.wallet, pos);
         const closed = await closePosition(this.connection, this.wallet, pos);
         if (closed) {
           toRemove.push(i);
@@ -281,7 +282,7 @@ export class DLMMAgent {
       // ── Take profit: token terkonversi semua ke SOL ──────────────────────
       if (status.tokenConvertedToSol && !status.isInRange) {
         console.log(`\n✅ Take profit: ${pos.poolName} — semua token jadi SOL`);
-        
+        if (status.feeEarned > 0) await claimFees(this.connection, this.wallet, pos);
         const closed = await closePosition(this.connection, this.wallet, pos);
         if (closed) {
           toRemove.push(i);
@@ -337,7 +338,28 @@ export class DLMMAgent {
   private async close(pos: ActivePosition, status: PositionStatus, reason: string, idx: number): Promise<boolean> {
     const ok = await closePosition(this.connection, this.wallet, pos);
     if (ok) {
-      this.tracker.removePosition(pos.positionKey.publicKey.toBase58());
+      const key = pos.positionKey.publicKey.toBase58();
+      const track = this.tracker.getTrack(key);
+      // Record performance untuk learning system
+      await recordPerformance({
+        pool: pos.poolAddress,
+        poolName: pos.poolName,
+        strategy: String(pos.strategyType),
+        binRange: pos.binRange,
+        binStep: 100, // default
+        organicScore: 0,
+        holders: 0,
+        marketCap: 0,
+        feeActiveTvlRatio: 0,
+        solDeposited: pos.solDeposited,
+        feesEarnedSol: status.feeEarned,
+        finalValueSol: status.currentValue,
+        initialValueSol: pos.solDeposited,
+        minutesInRange: 0,
+        minutesHeld: (track?.hoursHeld || 0) * 60,
+        closeReason: reason,
+      });
+      this.tracker.removePosition(key);
       await this.telegram.alertPositionClosed(pos, status.pnlPercent, status.feeEarned, reason);
       savePositions(this.activePositions.filter((_, i) => i !== idx));
     }
@@ -347,7 +369,56 @@ export class DLMMAgent {
   // ── Find & enter ───────────────────────────────────────────────────────────
   private async findAndEnter(solBal: number) {
     const topPools = rankPools(this.pools);
-    const openAddrs = new Set(this.activePositions.map(p => p.poolAddress));
+
+    // Cek posisi aktif di blockchain via LP Agent (termasuk posisi manual)
+    // Ini mencegah double posisi kalau user buka manual dari UI Meteora
+    let onChainPools = new Set<string>();
+    if (CONFIG.ai.lpAgentApiKey) {
+      try {
+        const res = await fetch(
+          `https://api.lpagent.io/open-api/v1/lp-positions/opening?owner=${this.wallet.publicKey.toBase58()}`,
+          { headers: { 'x-api-key': CONFIG.ai.lpAgentApiKey } }
+        );
+        const data = await res.json() as any;
+        if (data.status === 'success' && data.count > 0) {
+          for (const p of data.data) {
+            if (p.pool) onChainPools.add(p.pool);
+          }
+          // Sync posisi manual yang belum ada di memory
+          for (const p of data.data) {
+            const alreadyTracked = this.activePositions.some(pos => pos.poolAddress === p.pool);
+            if (!alreadyTracked && p.pool) {
+              const r = p.range || [];
+              const binRange = r.length >= 2 ? Math.round(Math.abs(r[1]-r[0])/2) : 34;
+              const manual = makeRecovered({
+                poolAddress: p.pool,
+                poolName: p.pairName || 'Manual Position',
+                positionKey: p.positionAddress || p.pool,
+                strategyType: p.strategyType || 'BidAsk',
+                binRange,
+                solDeposited: parseFloat(p.inputValue || '0'),
+                openedAt: new Date(Date.now() - parseFloat(p.age || '0') * 3600000),
+                entryPrice: 0,
+              });
+              this.activePositions.push(manual);
+              this.tracker.addPosition(manual, 0);
+              savePositions(this.activePositions);
+              console.log(`  📥 Manual position detected: ${manual.poolName} | age ${p.age}h`);
+              await this.telegram.alertError('Manual position detected', `${manual.poolName} — synced ke bot`);
+            }
+          }
+          if (onChainPools.size > 0) {
+            console.log(`  🔍 On-chain positions: ${onChainPools.size} (termasuk manual)`);
+          }
+        }
+      } catch {}
+    }
+
+    // Gabungkan pool dari memory + blockchain
+    const openAddrs = new Set([
+      ...this.activePositions.map(p => p.poolAddress),
+      ...onChainPools,
+    ]);
 
     // Prioritas flip target
     if (this.flipTargetPool) {
@@ -419,6 +490,11 @@ export class DLMMAgent {
 === WALLET ===
 SOL: ${solBal.toFixed(4)} | Posisi: ${this.activePositions.length}/${CONFIG.agent.maxPositions}
 SOL untuk posisi ini: ${solAmt.toFixed(3)}
+
+=== LESSONS DARI POSISI SEBELUMNYA ===
+\${getLessonsForPrompt(8) || 'Belum ada lessons'}
+
+Performance: \${getPerformanceSummary()}
 
 === STRATEGI BEAR MARKET (LP Army) ===
 - SOL-only one-sided, tidak pernah dual side
