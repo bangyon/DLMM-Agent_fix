@@ -4,3 +4,7 @@ node_modules/
 .env
 data/
 node_modules/
+dist/
+*.bak
+*.bak2
+data/
