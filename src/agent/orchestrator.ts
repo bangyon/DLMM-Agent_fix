@@ -76,7 +76,9 @@ export class DLMMAgent {
   private stream: any = null;
   private recentlyClosedPools: Map<string, number> = new Map();
   private outOfRangeRightSince: Map<string, number> = new Map();
-  private tokenSidePositions: Set<string> = new Set(); // posKey yang sedang token-side
+  private tokenSidePositions: Set<string> = new Set();
+  private totalFeeCompounded = 0;
+  private dailyStats = { date: '', wins: 0, losses: 0, totalPnl: 0, totalFee: 0, startSol: 0 };
 
   constructor() {
     // pump.helius.com lebih cepat untuk meme tokens
@@ -107,7 +109,7 @@ export class DLMMAgent {
     this.telegram.setCommandHandler(async (cmd: string) => {
       if (cmd === 'close_all') {
         console.log('\n📱 Telegram: close semua posisi');
-        for (let i = 0; i < this.activePositions.length; i++) {
+        for (let i = this.activePositions.length - 1; i >= 0; i--) {
           const pos = this.activePositions[i];
           const status = await checkPositionStatus(this.connection, this.wallet, pos);
           if (status) await this.close(pos, status, 'Manual close via Telegram', i);
@@ -121,7 +123,7 @@ export class DLMMAgent {
         } else {
           const lines = this.activePositions.map(p => {
             const track = this.tracker.getTrack(p.positionKey.publicKey.toBase58());
-            return `📌 <b>${p.poolName}</b>\nSOL: ${p.solDeposited.toFixed(3)} | Hold: ${track?.hoursHeld.toFixed(1) || 0}h | Strategy: ${p.strategyType}`;
+            return `📌 <b>${p.poolName}</b>\nSOL: ${p.solDeposited.toFixed(3)} | Hold: ${(track?.hoursHeld || 0).toFixed(1)}h | ${p.strategyType}`;
           }).join('\n\n');
           await this.telegram.send(`📊 <b>Posisi Aktif (${this.activePositions.length})</b>\n\n${lines}`);
         }
@@ -132,14 +134,10 @@ export class DLMMAgent {
           await this.telegram.send('📭 Belum ada pool memory');
         } else {
           const lines = memories.map(m =>
-            `${m.blacklisted ? '🚫' : m.winRate >= 50 ? '✅' : '⚠️'} <b>${m.poolName}</b>\n${m.deploys} deploy | Win ${m.winRate}% | Avg PnL ${m.avgPnl.toFixed(2)}%`
+            `${m.blacklisted ? '🚫' : m.winRate >= 50 ? '✅' : '⚠️'} <b>${m.poolName}</b>\n${m.deploys} deploy | Win ${m.winRate}% | Avg ${m.avgPnl.toFixed(2)}%`
           ).join('\n\n');
           await this.telegram.send(`🧠 <b>Pool Memory</b>\n\n${lines}`);
         }
-      } else if (cmd === 'pause') {
-        await this.telegram.send('⏸ Bot di-pause. Posisi aktif tetap dimonitor.');
-      } else if (cmd === 'resume') {
-        await this.telegram.send('▶️ Bot resume! Akan scan pool di cycle berikutnya.');
       }
     });
     const sol = await this.connection.getBalance(this.wallet.publicKey) / LAMPORTS_PER_SOL;
@@ -215,12 +213,10 @@ export class DLMMAgent {
   stop() { this.isRunning = false; console.log('🛑 Stopped'); }
 
   private async cycle() {
-    // Cek pause dari Telegram
     if (this.telegram.getBotPaused()) {
       console.log('⏸ Bot di-pause via Telegram — skip cycle');
       return;
     }
-
     this.cycleCount++;
     const now = new Date().toLocaleString('id-ID');
     console.log(`\n${'─'.repeat(55)}`);
@@ -246,15 +242,12 @@ export class DLMMAgent {
     // Cari posisi baru hanya kalau slot kosong
     const slots = CONFIG.agent.maxPositions - this.activePositions.length;
     const hasFunds = solBal >= CONFIG.agent.solPerPosition + 0.02;
-
-    // Time-based filter: hindari jam sepi (00:00 - 06:00 WIB = 17:00-23:00 UTC)
     const hourUTC = new Date().getUTCHours();
-    const isQuietHours = hourUTC >= 17 && hourUTC < 23; // 00:00-06:00 WIB
+    const isQuietHours = hourUTC >= 17 && hourUTC < 23;
     if (isQuietHours && this.activePositions.length === 0) {
       const wibHour = (hourUTC + 7) % 24;
       console.log(`  🌙 Jam sepi (${wibHour.toString().padStart(2,'0')}:xx WIB) — skip scan pool baru`);
     }
-
     if (slots > 0 && hasFunds && !isQuietHours) {
       await this.findAndEnter(solBal);
     }
@@ -285,6 +278,25 @@ export class DLMMAgent {
     if (this.cycleCount % 10 === 0) {
       const sol2 = await this.connection.getBalance(this.wallet.publicKey) / LAMPORTS_PER_SOL;
       await this.telegram.alertCycleSummary(this.cycleCount, [], sol2);
+    }
+
+    // Daily summary jam 23:50 WIB (16:50 UTC)
+    const utcHour = new Date().getUTCHours();
+    const utcMin = new Date().getUTCMinutes();
+    const todayStr = new Date().toISOString().split('T')[0];
+    if (!this.dailyStats.date) { this.dailyStats.date = todayStr; this.dailyStats.startSol = solBal; }
+    if (utcHour === 16 && utcMin >= 50 && this.dailyStats.date !== todayStr) {
+      this.dailyStats.date = todayStr;
+      const sol2 = await this.connection.getBalance(this.wallet.publicKey) / LAMPORTS_PER_SOL;
+      const pnlSol = sol2 - this.dailyStats.startSol;
+      await this.telegram.send(
+        `📅 <b>Daily Summary</b>\n\n` +
+        `💰 SOL: ${this.dailyStats.startSol.toFixed(4)} → ${sol2.toFixed(4)} (${pnlSol >= 0 ? '+' : ''}${pnlSol.toFixed(4)})` +
+        `\n✅ Wins: ${this.dailyStats.wins} | ❌ Losses: ${this.dailyStats.losses}` +
+        `\n💸 Fee: ${this.dailyStats.totalFee.toFixed(4)} SOL` +
+        `\n🔄 Cycles: ${this.cycleCount}`
+      );
+      this.dailyStats = { date: todayStr, wins: 0, losses: 0, totalPnl: 0, totalFee: 0, startSol: sol2 };
     }
   }
 
@@ -327,7 +339,7 @@ export class DLMMAgent {
       if (!status.isInRange) await this.telegram.alertOutOfRange(pos, status.pnlPercent);
       if (status.feeEarned > 0.001) await claimFees(this.connection, this.wallet, pos);
 
-      // ── BidAsk Flip: SOL terkonversi semua ke token ──────────────────────
+      // ── BidAsk Flip: SOL terkonversi semua ke token ──────────────────
       if (status.solConvertedToToken && !status.isInRange) {
         console.log(`\n🔄 BidAsk FLIP: ${pos.poolName} — SOL habis jadi token, reopen token-side`);
         if (status.feeEarned > 0) await claimFees(this.connection, this.wallet, pos);
@@ -348,7 +360,6 @@ export class DLMMAgent {
       if (status.tokenConvertedToSol && !status.isInRange) {
         const isTokenSide = this.tokenSidePositions.has(key);
         if (isTokenSide) {
-          // Token-side selesai — AI evaluate: balik SOL side atau cari pool lain?
           console.log(`\n🔄 Token-side selesai: ${pos.poolName} — tanya AI next step`);
           const pool = this.pools.find(p => p.address === pos.poolAddress);
           const mom = pool ? await getTokenMomentum(pool.tokenX.mint, pool.tokenX.symbol) : null;
@@ -360,6 +371,7 @@ export class DLMMAgent {
           if (closed) {
             this.tokenSidePositions.delete(key);
             this.recentlyClosedPools.set(pos.poolAddress, Date.now());
+            recordPoolResult(pos.poolAddress, pos.poolName, status.pnlPercent, status.feeEarned, 'token-side complete');
             toRemove.push(i);
             this.tracker.removePosition(key);
             savePositions(this.activePositions.filter((_, j) => j !== i));
@@ -371,12 +383,12 @@ export class DLMMAgent {
             }
           }
         } else {
-          // SOL side biasa — take profit
           console.log(`\n✅ Take profit: ${pos.poolName} — semua token jadi SOL`);
           if (status.feeEarned > 0) await claimFees(this.connection, this.wallet, pos);
           const closed = await closePosition(this.connection, this.wallet, pos);
           if (closed) {
             this.recentlyClosedPools.set(pos.poolAddress, Date.now());
+            recordPoolResult(pos.poolAddress, pos.poolName, status.pnlPercent, status.feeEarned, 'take profit');
             toRemove.push(i);
             this.tracker.removePosition(key);
             savePositions(this.activePositions.filter((_, j) => j !== i));
@@ -404,7 +416,7 @@ export class DLMMAgent {
         continue;
       }
 
-      // ── Out of range KANAN tracker ───────────────────────────────────────────
+      // ── Out of range KANAN tracker ─────────────────────────────
       const posKey = pos.positionKey.publicKey.toBase58();
       if (!status.isInRange && !status.solConvertedToToken && !status.tokenConvertedToSol) {
         if (!this.outOfRangeRightSince.has(posKey)) {
@@ -422,28 +434,12 @@ export class DLMMAgent {
         console.log(`  ⚡ ${pos.poolName}: out of range kanan ${outOfRangeRightMinutes.toFixed(1)} menit — AI evaluasi`);
       }
 
-      // ── AI evaluation saat kritis ──────────────────────────────────────────────
+      // ── AI evaluation saat kritis ────────────────────────────────────────
       const hoursHeld = track?.hoursHeld || 0;
-      // ── Stop loss berbasis fee ─────────────────────────────────────────────
-      // Kalau fee sudah cover loss → hold lebih lama (fee protecting position)
-      // Kalau 30 menit tidak ada fee sama sekali → cut loss lebih cepat
-      const feeVsLoss = status.feeEarned - Math.abs(Math.min(0, status.pnlPercent / 100 * pos.solDeposited));
-      const feeProtected = feeVsLoss > 0; // fee sudah cover impermanent loss
-      const noFeeAfter30Min = hoursHeld > 0.5 && status.feeEarned < 0.0001;
-
-      if (noFeeAfter30Min && !status.isInRange) {
-        console.log(`  💸 ${pos.poolName}: 30 menit tidak ada fee + out of range — cut loss`);
-        if (await this.close(pos, status, 'No fee after 30min + out of range', i)) toRemove.push(i);
-        continue;
-      }
-
-      // Fee protecting: kalau fee sudah cover loss, naikkan threshold close ke -10%
-      const effectiveLossThreshold = feeProtected ? -10 : -5;
-
       const isCritical =
-        status.pnlPercent < effectiveLossThreshold ||                    // Loss threshold -3% → -5%
-        (!status.isInRange && hoursHeld > 1) ||       // Out of range > 1 jam
-        outOfRangeRightMinutes > 5;                   // Out of range KANAN > 5 menit
+        status.pnlPercent < -5 ||
+        (!status.isInRange && hoursHeld > 1) ||
+        outOfRangeRightMinutes > 5;
       if (isCritical) {
         const pool = this.pools.find(p => p.address === pos.poolAddress);
         const mom = pool ? await getTokenMomentum(pool.tokenX.mint, pool.tokenX.symbol) : null;
@@ -469,6 +465,7 @@ export class DLMMAgent {
     const ok = await closePosition(this.connection, this.wallet, pos);
     if (ok) {
       this.recentlyClosedPools.set(pos.poolAddress, Date.now());
+      recordPoolResult(pos.poolAddress, pos.poolName, status.pnlPercent, status.feeEarned, reason);
       const key = pos.positionKey.publicKey.toBase58();
       const track = this.tracker.getTrack(key);
       // Record performance untuk learning system
@@ -490,8 +487,6 @@ export class DLMMAgent {
         minutesHeld: (track?.hoursHeld || 0) * 60,
         closeReason: reason,
       });
-      // Record ke pool memory untuk tracking win rate
-      recordPoolResult(pos.poolAddress, pos.poolName, status.pnlPercent, status.feeEarned, reason);
       this.tracker.removePosition(key);
       await this.telegram.alertPositionClosed(pos, status.pnlPercent, status.feeEarned, reason);
       savePositions(this.activePositions.filter((_, i) => i !== idx));
@@ -584,13 +579,6 @@ export class DLMMAgent {
         }
         return true;
       })
-      .filter(p => {
-        if (isBlacklisted(p.address)) {
-          console.log(`   🚫 Skip ${p.name} — blacklisted di pool memory`);
-          return false;
-        }
-        return true;
-      })
       .slice(0, 5);
 
     if (candidates.length === 0) { console.log('⚠️  Semua pool sudah ada posisi'); return; }
@@ -621,6 +609,9 @@ export class DLMMAgent {
       console.log(`  🚨 Skip low mcap: ${pool.name} ($${(momentum.marketCap/1000).toFixed(0)}K)`); return false;
     }
     if (pool.tvl < 50) { console.log(`  🚨 Skip low TVL: ${pool.name}`); return false; }
+    if (pool.poolAgeDays !== undefined && pool.poolAgeDays < 1) {
+      console.log(`  🚨 Skip pool terlalu baru: ${pool.name} (${pool.poolAgeDays.toFixed(1)} hari)`); return false;
+    }
 
     const mult = getSolAllocationMultiplier(pool);
     const kellySol = this.getKellySize(pool.address);
@@ -628,8 +619,6 @@ export class DLMMAgent {
     const volatilityData = await analyzeVolatility(pool.tokenX.mint, pool.tokenX.symbol, pool.binStep);
     const topPools = rankPools(this.pools).slice(0, 3);
 
-    const strategyRec = this.determineStrategy(pool, momentum, volatilityData);
-    console.log(`   📊 Strategy rec: ${strategyRec.strategy.toUpperCase()} — ${strategyRec.reason}`);
     const prompt = this.buildEntryPrompt(topPools, bundlerReport, volatilityData, solBal, solAmount, momentum, rugCheck);
     const decision = await askAI(prompt);
 
@@ -688,28 +677,27 @@ SOL untuk posisi ini: ${solAmt.toFixed(3)}
 
 Performance: \${getPerformanceSummary()}
 
-=== STRATEGI SELECTION (WAJIB IKUTI) ===
+=== STRATEGI BEAR MARKET (LP Army) ===
+STRATEGY SELECTION (pilih berdasarkan kondisi):
 
-Pilih bid_ask KALAU salah satu terpenuhi:
-  - priceChange1h > +3% (token lagi pump)
-  - priceChange1h < -5% (token dump, tunggu reversal)
-  - volatility > 3.0 (harga bergerak liar)
-  - Pool umur < 3 hari (token masih fresh/volatile)
-  - Tidak ada sinyal sideways yang jelas
+bid_ask (default untuk meme):
+  - SOL-only, deposit HANYA di bawah active bin (bins_above = 0)
+  - Terbaik saat: token volatile, harga mungkin turun, ingin capture fee dari pump
+  - Max hold: 2 jam (spot_pump) atau 6 jam (bidask_flip untuk pool >3 hari)
+  - Bins: 34-69 standard, 100+ untuk wide range
 
-Pilih spot KALAU SEMUA terpenuhi:
-  - priceChange1h antara -2% sampai +2% (sideways)
-  - organic score >= 80 (real user, bukan bot)
-  - volatility < 2.5 (harga relatif stabil)
-  - Vol/TVL > 3x (fee mengalir tapi harga tidak liar)
-  - Pool sudah > 3 hari (established pool)
+spot (saat kondisi lebih stabil):
+  - Bisa dual-sided atau SOL-only dengan range symmetric
+  - Terbaik saat: token sideways, harga stable, organic score tinggi (>80)
+  - Bins above = bins below (symmetric)
+  - Max hold: 3-4 jam
 
 HARD RULES:
-  - bid_ask → binRange 34-69, bins_above HARUS 0, deposit SOL only
-  - spot → binRange 17-34, bins_above = bins_below (symmetric)
-  - JANGAN pakai curve
-  - bin step hanya 80-125
-  - TVL > $50, mcap > $200K
+  - bid_ask → bins_above HARUS 0
+  - spot → bins_above = bins_below
+  - JANGAN pernah gunakan 'curve'
+  - Bin step hanya 80-125
+  - Jangan masuk pool TVL <$50 atau mcap <$200K
 
 === DATA POOL ===
 ${formatPoolsForAI(pools)}
@@ -723,151 +711,7 @@ ${formatBundlerReportForAI(bundler)}
 === VOLATILITAS ===
 ${formatVolatilityForAI(vol)}
 
-=== REKOMENDASI STRATEGI (berdasarkan data) ===
-${this.determineStrategy(pools[0], momentum, vol).strategy.toUpperCase()}: ${this.determineStrategy(pools[0], momentum, vol).reason}
-
-=== POOL MEMORY (history bot ini) ===
-${formatPoolMemoryForAI(pools[0]?.address || "")}
-
 JSON: {"action":"open_position"|"skip","poolAddress":"address|null","strategyType":"bid_ask"|"spot","binRange":${CONFIG.agent.defaultBinRange},"reasoning":"alasan","riskLevel":"low"|"medium"|"high","confidence":0-100}`;
-  }
-
-
-
-  // ── Kelly criterion: adjust SOL size berdasarkan win rate ───────────────────
-  private getKellySize(poolAddress: string): number {
-    const base = CONFIG.agent.solPerPosition;
-    const { getPoolMemory } = require('../modules/poolMemory');
-    const mem = getPoolMemory(poolAddress);
-
-    if (!mem || mem.deploys < 3) return base; // belum cukup data → pakai base
-
-    const winRate = mem.winRate / 100;
-    const avgWin = 0.05;   // asumsi avg win +5%
-    const avgLoss = 0.03;  // asumsi avg loss -3%
-
-    // Kelly fraction = (winRate * avgWin - lossRate * avgLoss) / avgWin
-    const lossRate = 1 - winRate;
-    const kelly = (winRate * avgWin - lossRate * avgLoss) / avgWin;
-
-    // Gunakan half-Kelly untuk safety, clamp antara 0.5x-1.5x base
-    const halfKelly = kelly / 2;
-    const multiplier = Math.max(0.5, Math.min(1.5, 1 + halfKelly));
-
-    const adjusted = base * multiplier;
-    console.log(`   💰 Kelly size: ${adjusted.toFixed(3)} SOL (${multiplier.toFixed(2)}x base | win rate ${mem.winRate}% dari ${mem.deploys} deploy)`);
-    return adjusted;
-  }
-
-  // ── Pre-determine strategy berdasarkan data real ──────────────────────────
-  private determineStrategy(pool: any, momentum: any, volatilityData: any): {
-    strategy: 'bid_ask' | 'spot';
-    reason: string;
-    binRange: number;
-  } {
-    const price1h = momentum?.priceChange1h || 0;
-    const price24h = momentum?.priceChange24h || 0;
-    const volatility = volatilityData?.volatility || 0;
-    const organicScore = pool?.organicScore || 0;
-    const volTvl = pool?.volumeTvlRatio || 0;
-
-    // ── Dynamic bin range berdasarkan volatility ──────────────────────────
-    // Semakin volatile → range lebih lebar supaya tidak cepat out of range
-    let binRange: number;
-    if (volatility >= 6)      binRange = 69;  // sangat volatile
-    else if (volatility >= 4) binRange = 50;  // volatile
-    else if (volatility >= 2) binRange = 34;  // normal
-    else if (volatility >= 1) binRange = 25;  // stabil
-    else                      binRange = 17;  // sangat stabil
-
-    // ── Kondisi SPOT: SEMUA harus terpenuhi ──────────────────────────────
-    const isSideways = Math.abs(price1h) <= 2;
-    const isStable = volatility < 2.5;
-    const isOrganic = organicScore >= 80;
-    const hasGoodFee = volTvl >= 3;
-
-    if (isSideways && isStable && isOrganic && hasGoodFee) {
-      // Spot pakai bin range lebih sempit — concentrated liquidity
-      const spotBinRange = Math.min(binRange, 20);
-      return {
-        strategy: 'spot',
-        reason: `Sideways (${price1h.toFixed(1)}%/1h), vol ${volatility.toFixed(1)}, organic ${organicScore}, vol/TVL ${volTvl.toFixed(1)}x → binRange ${spotBinRange}`,
-        binRange: spotBinRange,
-      };
-    }
-
-    // ── BID_ASK: semua kondisi lain ───────────────────────────────────────
-    const reasons = [];
-    if (Math.abs(price1h) > 2) reasons.push(`price ${price1h.toFixed(1)}%/1h`);
-    if (volatility >= 2.5) reasons.push(`vol ${volatility.toFixed(1)}`);
-    if (organicScore < 80) reasons.push(`organic ${organicScore}`);
-    if (volTvl < 3) reasons.push(`vol/TVL ${volTvl.toFixed(1)}x`);
-
-    return {
-      strategy: 'bid_ask',
-      reason: (reasons.join(', ') || 'default') + ` → binRange ${binRange}`,
-      binRange,
-    };
-  }
-
-  // ── Reopen token-side setelah BidAsk FLIP ─────────────────────────────────
-  private async reopenTokenSide(pool: PoolInfo, solBal: number): Promise<void> {
-    const solAmount = Math.min(CONFIG.agent.solPerPosition, solBal * 0.4);
-    console.log(`  📥 Token-side reopen: ${pool.name} | ${solAmount.toFixed(3)} SOL`);
-
-    // Force decision token-side: bins_above > 0, bins_below = 0
-    const forcedDecision = {
-      action: 'open_position' as const,
-      poolAddress: pool.address,
-      strategyType: 'bid_ask' as const,
-      binRange: CONFIG.agent.defaultBinRange,
-      binsAbove: CONFIG.agent.defaultBinRange,
-      binsBelow: 0,
-      reasoning: 'Token-side reopen setelah BidAsk FLIP',
-      riskLevel: 'medium' as const,
-      confidence: 90,
-    };
-
-    const newPos = await openPosition(
-      this.connection, this.wallet,
-      pool.address, pool.name,
-      forcedDecision, solAmount
-    );
-
-    if (newPos) {
-      const momentum = await getTokenMomentum(pool.tokenX.mint, pool.tokenX.symbol);
-      this.activePositions.push(newPos);
-      this.tracker.addPosition(newPos, momentum.currentPrice);
-      // Tandai sebagai token-side
-      this.tokenSidePositions.add(newPos.positionKey.publicKey.toBase58());
-      savePositions(this.activePositions);
-      await this.telegram.alertPositionOpened(newPos, forcedDecision);
-      console.log(`  ✅ Token-side dibuka: ${pool.name} | ${solAmount.toFixed(3)} SOL`);
-    } else {
-      console.log(`  ❌ Gagal buka token-side: ${pool.name}`);
-      // Set cooldown baru supaya tidak langsung retry
-      this.recentlyClosedPools.set(pool.address, Date.now());
-    }
-  }
-
-  private buildTokenSideCompletePrompt(status: PositionStatus, momentum: any, pool: any): string {
-    return `Token-side posisi DLMM selesai (semua token → SOL). Putuskan next step.
-
-Pool: ${status.position.poolName}
-PnL total: ${status.pnlPercent.toFixed(2)}% | Fee: ${status.feeEarned.toFixed(4)} SOL
-Vol/TVL: ${pool?.volumeTvlRatio?.toFixed(1) || '?'}x
-Price 1h: ${momentum?.priceChange1h?.toFixed(1) || '?'}% | 24h: ${momentum?.priceChange24h?.toFixed(1) || '?'}%
-Mcap: $${((momentum?.marketCap || 0)/1000).toFixed(0)}K | Holders: ${momentum?.holders || '?'}
-
-OPSI:
-- open_position (poolAddress = alamat pool ini): Balik SOL-side di pool yang sama, harga sudah retraced cukup
-- skip: Cari pool lain, pool ini sudah tidak menarik
-
-PERTIMBANGAN:
-- Balik SOL side kalau: vol/TVL masih >3x, price tidak dump >20% dari entry, pool masih aktif
-- Skip kalau: momentum negatif kuat, vol/TVL rendah, pool sudah sepi
-
-JSON: {"action":"open_position"|"skip","poolAddress":"${status.position.poolAddress}|null","strategyType":"bid_ask","binRange":${CONFIG.agent.defaultBinRange},"reasoning":"alasan","riskLevel":"low"|"medium"|"high","confidence":0-100}`;
   }
 
   private buildClosePrompt(status: PositionStatus, momentum: any, pool: any, hoursHeld: number): string {
@@ -884,4 +728,95 @@ HOLD: in range, fee mengalir, momentum positif
 
 JSON: {"action":"hold"|"close_position"|"rebalance","reasoning":"alasan","riskLevel":"low"|"medium"|"high","confidence":0-100}`;
   }
+  getKellySize(poolAddress: string): number {
+    const base = CONFIG.agent.solPerPosition;
+    try {
+      const { getPoolMemory } = require('../modules/poolMemory');
+      const mem = getPoolMemory(poolAddress);
+      if (!mem || mem.deploys < 3) return base;
+      const winRate = mem.winRate / 100;
+      const lossRate = 1 - winRate;
+      const kelly = (winRate * 0.05 - lossRate * 0.03) / 0.05;
+      const multiplier = Math.max(0.5, Math.min(1.5, 1 + kelly / 2));
+      const adjusted = base * multiplier;
+      console.log(`   💰 Kelly: ${adjusted.toFixed(3)} SOL (${multiplier.toFixed(2)}x | wr ${mem.winRate}%)`);
+      return adjusted;
+    } catch { return base; }
+  }
+
+  determineStrategy(pool: any, momentum: any, volatilityData: any): { strategy: 'bid_ask' | 'spot'; reason: string; binRange: number } {
+    const price1h = momentum?.priceChange1h || 0;
+    const volatility = volatilityData?.volatility || 0;
+    const organicScore = pool?.organicScore || 0;
+    const volTvl = pool?.volumeTvlRatio || 0;
+    const poolAgeDays = pool?.poolAgeDays ?? 999;
+
+    let binRange = volatility >= 6 ? 69 : volatility >= 4 ? 50 : volatility >= 2 ? 34 : volatility >= 1 ? 25 : 17;
+
+    const isSideways = Math.abs(price1h) <= 2;
+    const isStable = volatility < 2.5;
+    const isOrganic = organicScore >= 80;
+    const hasGoodFee = volTvl >= 3;
+
+    if (isSideways && isStable && isOrganic && hasGoodFee) {
+      const spotBinRange = Math.min(binRange, 20);
+      return { strategy: 'spot', reason: `Sideways ${price1h.toFixed(1)}%/1h, vol ${volatility.toFixed(1)}, organic ${organicScore} -> binRange ${spotBinRange}`, binRange: spotBinRange };
+    }
+
+    const reasons: string[] = [];
+    if (Math.abs(price1h) > 2) reasons.push(`price ${price1h.toFixed(1)}%/1h`);
+    if (volatility >= 2.5) reasons.push(`vol ${volatility.toFixed(1)}`);
+    if (organicScore < 80) reasons.push(`organic ${organicScore}`);
+    if (volTvl < 3) reasons.push(`vol/TVL ${volTvl.toFixed(1)}x`);
+    if (poolAgeDays < 3) { reasons.push(`pool baru ${poolAgeDays.toFixed(1)}d`); binRange = Math.min(binRange * 1.5, 69); }
+
+    return { strategy: 'bid_ask', reason: (reasons.join(', ') || 'default') + ` -> binRange ${Math.round(binRange)} | age ${poolAgeDays.toFixed(1)}d`, binRange: Math.round(binRange) };
+  }
+
+  async reopenTokenSide(pool: any, solBal: number): Promise<void> {
+    const solAmount = Math.min(CONFIG.agent.solPerPosition, solBal * 0.4);
+    console.log(`  📥 Token-side reopen: ${pool.name} | ${solAmount.toFixed(3)} SOL`);
+    const forcedDecision: any = {
+      action: 'open_position',
+      poolAddress: pool.address,
+      strategyType: 'bid_ask',
+      binRange: CONFIG.agent.defaultBinRange,
+      binsAbove: CONFIG.agent.defaultBinRange,
+      binsBelow: 0,
+      reasoning: 'Token-side reopen setelah BidAsk FLIP',
+      riskLevel: 'medium',
+      confidence: 90,
+    };
+    const newPos = await openPosition(this.connection, this.wallet, pool.address, pool.name, forcedDecision, solAmount);
+    if (newPos) {
+      const momentum = await getTokenMomentum(pool.tokenX.mint, pool.tokenX.symbol);
+      this.activePositions.push(newPos);
+      this.tracker.addPosition(newPos, momentum.currentPrice);
+      this.tokenSidePositions.add(newPos.positionKey.publicKey.toBase58());
+      savePositions(this.activePositions);
+      await this.telegram.alertPositionOpened(newPos, forcedDecision);
+      console.log(`  ✅ Token-side dibuka: ${pool.name} | ${solAmount.toFixed(3)} SOL`);
+    } else {
+      console.log(`  ❌ Gagal buka token-side: ${pool.name}`);
+      this.recentlyClosedPools.set(pool.address, Date.now());
+    }
+  }
+
+  buildTokenSideCompletePrompt(status: any, momentum: any, pool: any): string {
+    return `Token-side posisi DLMM selesai (semua token jadi SOL). Putuskan next step.
+
+Pool: ${status.position?.poolName || 'Unknown'}
+PnL: ${status.pnlPercent?.toFixed(2) || '?'}% | Fee: ${status.feeEarned?.toFixed(4) || '?'} SOL
+Vol/TVL: ${pool?.volumeTvlRatio?.toFixed(1) || '?'}x
+Price 1h: ${momentum?.priceChange1h?.toFixed(1) || '?'}%
+Mcap: $${((momentum?.marketCap || 0)/1000).toFixed(0)}K
+
+OPSI:
+- open_position: Balik SOL-side di pool yang sama (kalau vol/TVL >3x, price tidak dump >20%)
+- skip: Cari pool lain
+
+JSON: {"action":"open_position"|"skip","poolAddress":"${status.position?.poolAddress || ''}|null","strategyType":"bid_ask","binRange":${CONFIG.agent.defaultBinRange},"reasoning":"alasan","riskLevel":"low"|"medium"|"high","confidence":0-100}`;
+  }
+
+
 }

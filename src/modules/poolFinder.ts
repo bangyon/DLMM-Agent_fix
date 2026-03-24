@@ -26,6 +26,7 @@ export interface PoolInfo {
   swapCount: number;
   warnings: number;
   activePositions: number;
+  poolAgeDays: number;   // umur pool dalam hari
   // Computed
   volumeTvlRatio: number;
   compositeScore: number;
@@ -136,6 +137,7 @@ function normalizePool(p: any): PoolInfo {
 
   const pool: PoolInfo = {
     address:          p.pool_address || '',
+    poolAgeDays:      p.pool_created_at ? (Date.now() - p.pool_created_at) / (1000 * 60 * 60 * 24) : 999,
     name:             p.name || '',
     tokenX: { mint: tokenX.address || '', symbol: tokenX.symbol || 'X', decimals: 9 },
     tokenY: { mint: tokenY.address || '', symbol: tokenY.symbol || 'SOL', decimals: 9 },
