@@ -115,8 +115,11 @@ export async function openPosition(
 
     // Meteora limit: max ~34 bins per tx untuk avoid InvalidRealloc
     const safeBinRange = Math.min(binRange, 34);
-    const safeMinBinId = activeBin.binId - safeBinRange;
-    const safeMaxBinId = activeBin.binId + safeBinRange;
+    const binsBelow = safeBinRange;
+    const binsAbove = strategyType === StrategyType.BidAsk ? 0 : safeBinRange;
+    const safeMinBinId = activeBin.binId - binsBelow;
+    const safeMaxBinId = activeBin.binId + binsAbove;
+    console.log(`   Bins: ${binsBelow} below + ${binsAbove} above active bin (strategy: ${strategyType === 0 ? 'Spot' : strategyType === 2 ? 'BidAsk' : 'Curve'})`);
 
     const createTx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
       positionPubKey: positionKey.publicKey,

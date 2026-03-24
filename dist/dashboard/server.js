@@ -1,37 +1,28 @@
-import http from 'http';
-import { WebSocketServer, WebSocket } from 'ws';
-import { getCompoundStats } from '../utils/feeTracker';
-
-export interface DashboardState {
-  wallet: string;
-  solBalance: number;
-  activePositions: any[];
-  cycleCount: number;
-  lastCycleAt: string;
-  isRunning: boolean;
-  feeStats: any;
-  topPools?: any[];
-  lastScanAt?: string;
-}
-
-let currentState: DashboardState = {
-  wallet: '', solBalance: 0, activePositions: [],
-  cycleCount: 0, lastCycleAt: '', isRunning: false, feeStats: {},
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
 };
-
-const clients = new Set<WebSocket>();
-
-export function updateDashboardState(partial: Partial<DashboardState>) {
-  currentState = { ...currentState, ...partial, feeStats: getCompoundStats() };
-  // Broadcast ke semua WebSocket clients
-  const payload = JSON.stringify(currentState);
-  for (const client of clients) {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(payload);
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.updateDashboardState = updateDashboardState;
+exports.startDashboard = startDashboard;
+const http_1 = __importDefault(require("http"));
+const ws_1 = require("ws");
+const feeTracker_1 = require("../utils/feeTracker");
+let currentState = {
+    wallet: '', solBalance: 0, activePositions: [],
+    cycleCount: 0, lastCycleAt: '', isRunning: false, feeStats: {},
+};
+const clients = new Set();
+function updateDashboardState(partial) {
+    currentState = { ...currentState, ...partial, feeStats: (0, feeTracker_1.getCompoundStats)() };
+    // Broadcast ke semua WebSocket clients
+    const payload = JSON.stringify(currentState);
+    for (const client of clients) {
+        if (client.readyState === ws_1.WebSocket.OPEN) {
+            client.send(payload);
+        }
     }
-  }
 }
-
 const HTML = `<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -539,36 +530,35 @@ connect();
 </script>
 </body>
 </html>`;
-
-export function startDashboard(port = 3000) {
-  const server = http.createServer((req, res) => {
-    if (req.url === '/api/state') {
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({ ...currentState, feeStats: getCompoundStats() }));
-    } else {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(HTML);
-    }
-  });
-
-  // WebSocket server untuk real-time push
-  let wss: WebSocketServer;
-  try {
-    wss = new WebSocketServer({ server });
-    wss.on('connection', (ws) => {
-      clients.add(ws);
-      // Kirim state saat ini langsung
-      ws.send(JSON.stringify({ ...currentState, feeStats: getCompoundStats() }));
-      ws.on('close', () => clients.delete(ws));
-      ws.on('error', () => clients.delete(ws));
+function startDashboard(port = 3000) {
+    const server = http_1.default.createServer((req, res) => {
+        if (req.url === '/api/state') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            res.end(JSON.stringify({ ...currentState, feeStats: (0, feeTracker_1.getCompoundStats)() }));
+        }
+        else {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(HTML);
+        }
     });
-  } catch {
-    console.log('   WebSocket tidak tersedia, pakai polling');
-  }
-
-  server.listen(port, () => {
-    console.log(`\n🌐 Dashboard: http://localhost:${port}`);
-  });
-
-  return server;
+    // WebSocket server untuk real-time push
+    let wss;
+    try {
+        wss = new ws_1.WebSocketServer({ server });
+        wss.on('connection', (ws) => {
+            clients.add(ws);
+            // Kirim state saat ini langsung
+            ws.send(JSON.stringify({ ...currentState, feeStats: (0, feeTracker_1.getCompoundStats)() }));
+            ws.on('close', () => clients.delete(ws));
+            ws.on('error', () => clients.delete(ws));
+        });
+    }
+    catch {
+        console.log('   WebSocket tidak tersedia, pakai polling');
+    }
+    server.listen(port, () => {
+        console.log(`\n🌐 Dashboard: http://localhost:${port}`);
+    });
+    return server;
 }
+//# sourceMappingURL=server.js.map
