@@ -14,6 +14,7 @@ import { comparePoolBacktests } from '../backtest/simulator';
 import { getTokenMomentum, checkRug, formatMomentumForAI } from '../modules/priceFeed';
 import { PositionTracker } from '../modules/positionTracker';
 import { recordPerformance, getLessonsForPrompt, getPerformanceSummary } from '../modules/lessons';
+import { recordPoolResult, isBlacklisted, getPoolMemorySignal, formatPoolMemoryForAI } from '../modules/poolMemory';
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -418,6 +419,8 @@ export class DLMMAgent {
         minutesHeld: (track?.hoursHeld || 0) * 60,
         closeReason: reason,
       });
+      // Record ke pool memory untuk tracking win rate
+      recordPoolResult(pos.poolAddress, pos.poolName, status.pnlPercent, status.feeEarned, reason);
       this.tracker.removePosition(key);
       await this.telegram.alertPositionClosed(pos, status.pnlPercent, status.feeEarned, reason);
       savePositions(this.activePositions.filter((_, i) => i !== idx));
@@ -510,6 +513,13 @@ export class DLMMAgent {
         }
         return true;
       })
+      .filter(p => {
+        if (isBlacklisted(p.address)) {
+          console.log(`   🚫 Skip ${p.name} — blacklisted di pool memory`);
+          return false;
+        }
+        return true;
+      })
       .slice(0, 5);
 
     if (candidates.length === 0) { console.log('⚠️  Semua pool sudah ada posisi'); return; }
@@ -546,6 +556,8 @@ export class DLMMAgent {
     const volatilityData = await analyzeVolatility(pool.tokenX.mint, pool.tokenX.symbol, pool.binStep);
     const topPools = rankPools(this.pools).slice(0, 3);
 
+    const strategyRec = this.determineStrategy(pool, momentum, volatilityData);
+    console.log(`   📊 Strategy rec: ${strategyRec.strategy.toUpperCase()} — ${strategyRec.reason}`);
     const prompt = this.buildEntryPrompt(topPools, bundlerReport, volatilityData, solBal, solAmount, momentum, rugCheck);
     const decision = await askAI(prompt);
 
@@ -604,27 +616,28 @@ SOL untuk posisi ini: ${solAmt.toFixed(3)}
 
 Performance: \${getPerformanceSummary()}
 
-=== STRATEGI BEAR MARKET (LP Army) ===
-STRATEGY SELECTION (pilih berdasarkan kondisi):
+=== STRATEGI SELECTION (WAJIB IKUTI) ===
 
-bid_ask (default untuk meme):
-  - SOL-only, deposit HANYA di bawah active bin (bins_above = 0)
-  - Terbaik saat: token volatile, harga mungkin turun, ingin capture fee dari pump
-  - Max hold: 2 jam (spot_pump) atau 6 jam (bidask_flip untuk pool >3 hari)
-  - Bins: 34-69 standard, 100+ untuk wide range
+Pilih bid_ask KALAU salah satu terpenuhi:
+  - priceChange1h > +3% (token lagi pump)
+  - priceChange1h < -5% (token dump, tunggu reversal)
+  - volatility > 3.0 (harga bergerak liar)
+  - Pool umur < 3 hari (token masih fresh/volatile)
+  - Tidak ada sinyal sideways yang jelas
 
-spot (saat kondisi lebih stabil):
-  - Bisa dual-sided atau SOL-only dengan range symmetric
-  - Terbaik saat: token sideways, harga stable, organic score tinggi (>80)
-  - Bins above = bins below (symmetric)
-  - Max hold: 3-4 jam
+Pilih spot KALAU SEMUA terpenuhi:
+  - priceChange1h antara -2% sampai +2% (sideways)
+  - organic score >= 80 (real user, bukan bot)
+  - volatility < 2.5 (harga relatif stabil)
+  - Vol/TVL > 3x (fee mengalir tapi harga tidak liar)
+  - Pool sudah > 3 hari (established pool)
 
 HARD RULES:
-  - bid_ask → bins_above HARUS 0
-  - spot → bins_above = bins_below
-  - JANGAN pernah gunakan 'curve'
-  - Bin step hanya 80-125
-  - Jangan masuk pool TVL <$50 atau mcap <$200K
+  - bid_ask → binRange 34-69, bins_above HARUS 0, deposit SOL only
+  - spot → binRange 17-34, bins_above = bins_below (symmetric)
+  - JANGAN pakai curve
+  - bin step hanya 80-125
+  - TVL > $50, mcap > $200K
 
 === DATA POOL ===
 ${formatPoolsForAI(pools)}
@@ -638,9 +651,55 @@ ${formatBundlerReportForAI(bundler)}
 === VOLATILITAS ===
 ${formatVolatilityForAI(vol)}
 
+=== REKOMENDASI STRATEGI (berdasarkan data) ===
+${this.determineStrategy(pools[0], momentum, vol).strategy.toUpperCase()}: ${this.determineStrategy(pools[0], momentum, vol).reason}
+
+=== POOL MEMORY (history bot ini) ===
+${formatPoolMemoryForAI(pools[0]?.address || "")}
+
 JSON: {"action":"open_position"|"skip","poolAddress":"address|null","strategyType":"bid_ask"|"spot","binRange":${CONFIG.agent.defaultBinRange},"reasoning":"alasan","riskLevel":"low"|"medium"|"high","confidence":0-100}`;
   }
 
+
+
+  // ── Pre-determine strategy berdasarkan data real ──────────────────────────
+  private determineStrategy(pool: any, momentum: any, volatilityData: any): {
+    strategy: 'bid_ask' | 'spot';
+    reason: string;
+    binRange: number;
+  } {
+    const price1h = momentum?.priceChange1h || 0;
+    const volatility = volatilityData?.volatility || 0;
+    const organicScore = pool?.organicScore || 0;
+    const volTvl = pool?.volumeTvlRatio || 0;
+
+    // Kondisi spot: SEMUA harus terpenuhi
+    const isSideways = Math.abs(price1h) <= 2;
+    const isStable = volatility < 2.5;
+    const isOrganic = organicScore >= 80;
+    const hasGoodFee = volTvl >= 3;
+
+    if (isSideways && isStable && isOrganic && hasGoodFee) {
+      return {
+        strategy: 'spot',
+        reason: `Sideways (${price1h.toFixed(1)}%/1h), volatility ${volatility.toFixed(1)}, organic ${organicScore}, vol/TVL ${volTvl.toFixed(1)}x`,
+        binRange: 20,
+      };
+    }
+
+    // Semua kondisi lain → bid_ask
+    const reasons = [];
+    if (Math.abs(price1h) > 2) reasons.push(`price ${price1h.toFixed(1)}%/1h`);
+    if (volatility >= 2.5) reasons.push(`volatility ${volatility.toFixed(1)}`);
+    if (organicScore < 80) reasons.push(`organic ${organicScore}`);
+    if (volTvl < 3) reasons.push(`vol/TVL ${volTvl.toFixed(1)}x`);
+
+    return {
+      strategy: 'bid_ask',
+      reason: reasons.join(', ') || 'default bid_ask',
+      binRange: 34,
+    };
+  }
 
   // ── Reopen token-side setelah BidAsk FLIP ─────────────────────────────────
   private async reopenTokenSide(pool: PoolInfo, solBal: number): Promise<void> {
