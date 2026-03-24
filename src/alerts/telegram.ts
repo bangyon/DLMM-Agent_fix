@@ -11,6 +11,8 @@ export class TelegramAlert {
   private pendingCallback: ((poolIndex: number) => void) | null = null;
   private pollOffset = 0;
   private isPolling = false;
+  private commandHandler: ((cmd: string) => void) | null = null;
+  private isPaused = false;
 
   constructor() {
     this.botToken = process.env.TELEGRAM_BOT_TOKEN || '';
@@ -87,9 +89,36 @@ export class TelegramAlert {
 
             // Handle text message commands
             if (update.message?.text) {
-              const text = update.message.text.toLowerCase();
-              if (text === '/status') {
-                await this.send('📊 Bot sedang berjalan. Gunakan dashboard: http://localhost:3000');
+              const cmd = update.message.text.toLowerCase().trim();
+              console.log(`\n📱 Telegram command: ${cmd}`);
+
+              if (cmd === '/status') {
+                await this.send('📊 Bot berjalan\nGunakan: /positions /pause /resume /close /memory');
+              } else if (cmd === '/pause') {
+                this.isPaused = true;
+                await this.send('⏸ Bot di-pause — tidak akan buka posisi baru\nKirim /resume untuk lanjut');
+                if (this.commandHandler) this.commandHandler('pause');
+              } else if (cmd === '/resume') {
+                this.isPaused = false;
+                await this.send('▶️ Bot di-resume — kembali normal');
+                if (this.commandHandler) this.commandHandler('resume');
+              } else if (cmd === '/close') {
+                await this.send('🔴 Menutup semua posisi aktif...');
+                if (this.commandHandler) this.commandHandler('close_all');
+              } else if (cmd === '/positions') {
+                if (this.commandHandler) this.commandHandler('get_positions');
+              } else if (cmd === '/memory') {
+                if (this.commandHandler) this.commandHandler('get_memory');
+              } else if (cmd === '/help') {
+                await this.send(
+                  '📖 <b>Commands:</b>\n' +
+                  '/status — status bot\n' +
+                  '/positions — posisi aktif\n' +
+                  '/pause — pause buka posisi baru\n' +
+                  '/resume — resume bot\n' +
+                  '/close — close semua posisi\n' +
+                  '/memory — pool win rate history'
+                );
               }
             }
           }
@@ -241,5 +270,13 @@ export class TelegramAlert {
 
   async alertInfo(message: string) {
     await this.send(`ℹ️ ${message}`);
+  }
+
+  setCommandHandler(handler: (cmd: string) => void) {
+    this.commandHandler = handler;
+  }
+
+  getBotPaused(): boolean {
+    return this.isPaused;
   }
 }
