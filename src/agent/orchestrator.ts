@@ -677,27 +677,37 @@ SOL untuk posisi ini: ${solAmt.toFixed(3)}
 
 Performance: \${getPerformanceSummary()}
 
-=== STRATEGI BEAR MARKET (LP Army) ===
-STRATEGY SELECTION (pilih berdasarkan kondisi):
+=== STRATEGI SELECTION (WAJIB IKUTI) ===
 
-bid_ask (default untuk meme):
-  - SOL-only, deposit HANYA di bawah active bin (bins_above = 0)
-  - Terbaik saat: token volatile, harga mungkin turun, ingin capture fee dari pump
-  - Max hold: 2 jam (spot_pump) atau 6 jam (bidask_flip untuk pool >3 hari)
-  - Bins: 34-69 standard, 100+ untuk wide range
+5 STRATEGY (pilih berdasarkan kondisi pool):
 
-spot (saat kondisi lebih stabil):
-  - Bisa dual-sided atau SOL-only dengan range symmetric
-  - Terbaik saat: token sideways, harga stable, organic score tinggi (>80)
-  - Bins above = bins below (symmetric)
-  - Max hold: 3-4 jam
+1. stable_range (TERBAIK, fee concentrated):
+   Syarat: |price1h| < 5%, organic >= 80, vol/TVL >= 2x, pool >= 3 hari
+   → SPOT symmetric, binRange 17-20, bins_above = bins_below, max hold 6 jam
+
+2. volume_surge (fee income tinggi):
+   Syarat: fee/TVL > 0.15, vol/TVL >= 5x, organic >= 65
+   → BID_ASK SOL-only, binRange 34, bins_above = 0, max hold 1 jam
+
+3. bidask_flip (proven bear market):
+   Syarat: organic >= 75, |price1h| < 15%, pool >= 2 hari
+   → BID_ASK SOL-only, binRange 20-34, bins_above = 0, max hold 6 jam
+
+4. spot_dump/dump_recovery (risky):
+   Syarat: price turun >20% DAN trend sudah mulai naik lagi (konfirmasi reversal)
+   → BID_ASK SOL-only, binRange 30-50, max hold 3 jam
+
+5. spot_pump (DEPRECATED, hindari):
+   Hanya kalau: price naik >10% DAN fee/TVL > 0.12 DAN organic >= 65
+   → BID_ASK SOL-only, binRange 34-50, max hold 1 jam SAJA
 
 HARD RULES:
-  - bid_ask → bins_above HARUS 0
-  - spot → bins_above = bins_below
-  - JANGAN pernah gunakan 'curve'
-  - Bin step hanya 80-125
-  - Jangan masuk pool TVL <$50 atau mcap <$200K
+  - bid_ask → bins_above HARUS 0, deposit SOL only
+  - spot → bins_above = bins_below (symmetric)
+  - JANGAN pakai curve
+  - bin step hanya 80-125
+  - TVL > $50, mcap > $200K
+  - Pool < 1 hari → SKIP
 
 === DATA POOL ===
 ${formatPoolsForAI(pools)}

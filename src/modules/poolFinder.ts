@@ -39,7 +39,7 @@ export interface PoolInfo {
   feeMomentumScore: number;
 }
 
-export type MemeStrategy = 'spot_pump' | 'spot_dump' | 'bidask_flip' | 'skip';
+export type MemeStrategy = 'spot_pump' | 'spot_dump' | 'bidask_flip' | 'volume_surge' | 'stable_range' | 'skip';
 
 // Filter defaults — align dengan Meridian config
 const FILTERS = {
@@ -92,28 +92,68 @@ function detectStrategy(p: any, organic: number, feeRatio: number): {
   const trend = (p.price_trend || []) as number[];
   const recentTrend = trend.slice(-3).reduce((a: number, b: number) => a + b, 0);
   const priceChange = p.pool_price_change_pct || 0;
+  const volTvlRatio = p.tvl > 0 ? (p.volume || 0) / p.tvl : 0;
+  const poolAgeDays = p.pool_created_at ? (Date.now() - p.pool_created_at) / (1000 * 60 * 60 * 24) : 999;
 
-  // BidAsk Flip: organic tinggi, volume stabil, tidak sedang pump/dump
-  if (organic >= 75 && Math.abs(priceChange) < 15 && feeRatio > 0.05) {
+  // ── STABLE_RANGE: token sideways konsisten, fee concentrated ──────────────
+  // Kondisi: harga tidak bergerak jauh, organic tinggi, vol/TVL bagus
+  // Strategi: SPOT symmetric bin sempit, fee income stabil
+  if (
+    organic >= 80 &&
+    Math.abs(priceChange) < 5 &&      // sideways ketat
+    volTvlRatio >= 2 &&               // volume ada tapi tidak liar
+    feeRatio > 0.08 &&                // fee income bagus
+    poolAgeDays >= 3                  // pool established
+  ) {
+    return { strategy: 'stable_range', maxHoldHours: 6, binRangeHint: 17 };
+  }
+
+  // ── VOLUME_SURGE: volume spike tiba-tiba, fee income tinggi ───────────────
+  // Kondisi: vol/TVL sangat tinggi = banyak aktivitas = fee besar
+  // Strategi: BidAsk SOL-only, masuk sebelum harga bergerak jauh
+  if (
+    feeRatio > 0.15 &&                // fee/TVL sangat tinggi
+    volTvlRatio >= 5 &&               // volume surge
+    organic >= 65 &&
+    Math.abs(priceChange) < 30        // belum terlalu jauh bergerak
+  ) {
+    return { strategy: 'volume_surge', maxHoldHours: 1, binRangeHint: 34 };
+  }
+
+  // ── BIDASK_FLIP: pool stabil, organic tinggi, fee konsisten ───────────────
+  // Strategi terbaik untuk bear market — capture fee dari kedua arah
+  if (
+    organic >= 75 &&
+    Math.abs(priceChange) < 15 &&
+    feeRatio > 0.05 &&
+    poolAgeDays >= 2
+  ) {
     return { strategy: 'bidask_flip', maxHoldHours: 6, binRangeHint: 20 };
   }
 
-  // Spot Dump: price turun tapi mulai recovery (trend naik dari bawah)
-  if (priceChange < -20 && recentTrend > 0) {
+  // ── DUMP_RECOVERY: harga turun tapi ada konfirmasi reversal ───────────────
+  // IMPROVED dari spot_dump: wajib ada konfirmasi trend naik dulu
+  if (
+    priceChange < -20 &&              // dump signifikan
+    recentTrend > 1 &&                // trend mulai naik (konfirmasi reversal)
+    organic >= 60                     // masih ada organic activity
+  ) {
     return { strategy: 'spot_dump', maxHoldHours: 3, binRangeHint: 30 };
   }
 
-  // Spot Pump: price naik, volume tinggi
-  if (priceChange > 5 || feeRatio > 0.1) {
-    return { strategy: 'spot_pump', maxHoldHours: 2, binRangeHint: 34 };
+  // ── SPOT_PUMP: DIHAPUS sebagai default ────────────────────────────────────
+  // Hanya masuk kalau ada sinyal kuat: pump + volume sangat tinggi
+  if (priceChange > 10 && feeRatio > 0.12 && organic >= 65) {
+    return { strategy: 'spot_pump', maxHoldHours: 1, binRangeHint: 34 };
   }
 
-  return { strategy: 'spot_pump', maxHoldHours: 2, binRangeHint: 34 };
+  // Default: bidask_flip (lebih aman dari spot_pump)
+  return { strategy: 'bidask_flip', maxHoldHours: 4, binRangeHint: 25 };
 }
 
 function calcCompositeScore(p: PoolInfo): number {
-  // Organic score (40 poin max) — filter utama
-  const organicScore = Math.min(40, (p.organicScore / 100) * 40);
+  // Organic score (35 poin max) — filter utama
+  const organicScore = Math.min(35, (p.organicScore / 100) * 35);
   // Fee/TVL ratio (30 poin max) — yield
   const feeScore = Math.min(30, p.feeActiveTvlRatio * 200);
   // Volume (20 poin max) — aktivitas
@@ -121,7 +161,15 @@ function calcCompositeScore(p: PoolInfo): number {
   // Holders (10 poin) — distribusi sehat
   const holderScore = Math.min(10, (p.holders / 1000) * 5);
 
-  return Math.round(organicScore + feeScore + volScore + holderScore);
+  // Strategy bonus (5 poin) — reward strategy yang lebih efektif
+  let strategyBonus = 0;
+  if (p.strategy === 'stable_range') strategyBonus = 5;    // paling aman
+  else if (p.strategy === 'volume_surge') strategyBonus = 4; // fee tinggi
+  else if (p.strategy === 'bidask_flip') strategyBonus = 3;  // proven
+  else if (p.strategy === 'spot_dump') strategyBonus = 1;    // risky
+  else if (p.strategy === 'spot_pump') strategyBonus = 0;    // deprecated
+
+  return Math.round(organicScore + feeScore + volScore + holderScore + strategyBonus);
 }
 
 function normalizePool(p: any): PoolInfo {
