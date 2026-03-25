@@ -434,10 +434,21 @@ export class DLMMAgent {
         console.log(`  ⚡ ${pos.poolName}: out of range kanan ${outOfRangeRightMinutes.toFixed(1)} menit — AI evaluasi`);
       }
 
+      // ── Stop loss berbasis fee ─────────────────────────────────────────────
+      const feeVsLoss = status.feeEarned - Math.abs(Math.min(0, status.pnlPercent / 100 * pos.solDeposited));
+      const feeProtected = feeVsLoss > 0;
+      const noFeeAfter30Min = (track?.hoursHeld || 0) > 0.5 && status.feeEarned < 0.0001;
+      if (noFeeAfter30Min && !status.isInRange) {
+        console.log(`  💸 ${pos.poolName}: 30 menit tidak ada fee + out of range — cut loss`);
+        if (await this.close(pos, status, 'No fee after 30min + out of range', i)) toRemove.push(i);
+        continue;
+      }
+      const effectiveLossThreshold = feeProtected ? -40 : -30;
+
       // ── AI evaluation saat kritis ────────────────────────────────────────
       const hoursHeld = track?.hoursHeld || 0;
       const isCritical =
-        status.pnlPercent < -5 ||
+        status.pnlPercent < effectiveLossThreshold ||  // -30% normal, -40% kalau fee cover loss
         (!status.isInRange && hoursHeld > 1) ||
         outOfRangeRightMinutes > 5;
       if (isCritical) {
